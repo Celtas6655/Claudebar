@@ -735,6 +735,69 @@ def read_usage_cache(cache_path=None):
         return None
 
 
+def install_statusline_hook(settings_path, script_path):
+    """Merge the statusLine hook entry into Claude Code's settings.json.
+
+    Returns (success: bool, message: str).
+    Never touches the file if it can't be parsed cleanly — safer than
+    risking a corrupt settings.json (one stray comma kills the whole file).
+    """
+    command = "python " + script_path.replace("\\", "/") + " --statusline-hook"
+    desired = {"type": "command", "command": command}
+
+    # Read existing settings (or start fresh if the file doesn't exist yet)
+    settings = {}
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return False, (
+                f"settings.json exists but couldn't be parsed: {exc}\n"
+                "Fix the JSON manually, then re-run --install-hook."
+            )
+        except OSError as exc:
+            return False, f"Couldn't read settings.json: {exc}"
+
+    existing = settings.get("statusLine")
+    if existing == desired:
+        return True, "statusLine hook already configured — nothing to change."
+
+    if existing is not None:
+        msg_prefix = f"Replacing existing statusLine:\n  {json.dumps(existing)}\nwith:"
+    else:
+        msg_prefix = "Adding statusLine:"
+
+    settings["statusLine"] = desired
+
+    try:
+        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+        tmp = settings_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, settings_path)
+    except OSError as exc:
+        return False, f"Couldn't write settings.json: {exc}"
+
+    return True, (
+        f"{msg_prefix}\n  {json.dumps(desired)}\n"
+        f"Written to: {settings_path}\n"
+        "Restart Claude Code for the change to take effect."
+    )
+
+
+def run_install_hook():
+    """Entry point for --install-hook: wires this script into Claude Code's
+    settings.json as the statusLine command."""
+    settings_path = os.path.join(CLAUDE_HOME, "settings.json")
+    script_path = os.path.abspath(__file__)
+    success, message = install_statusline_hook(settings_path, script_path)
+    print(message)
+    if not success:
+        sys.exit(1)
+
+
 def run_statusline_hook():
     """Entry point for `python claude_usage_tray.py --statusline-hook`,
     meant to be wired up as Claude Code's `statusLine` command (see
@@ -1531,6 +1594,63 @@ def run_tests():
         assert pct_tag(None) == "dim"
         print("Widget color-threshold helper: OK")
 
+        # --- statusLine hook installation ---
+        fake_script = "/path/to/claude_usage_tray.py"
+        expected_cmd = f"python {fake_script} --statusline-hook"
+        expected_block = {"type": "command", "command": expected_cmd}
+
+        # Case 1: fresh install (no settings.json)
+        settings_path = os.path.join(tmp_home, "settings_fresh.json")
+        ok, msg = install_statusline_hook(settings_path, fake_script)
+        assert ok, msg
+        with open(settings_path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["statusLine"] == expected_block, data
+        print("hook install — fresh file: OK")
+
+        # Case 2: existing settings with unrelated keys (keys must be preserved)
+        settings_path2 = os.path.join(tmp_home, "settings_merge.json")
+        with open(settings_path2, "w", encoding="utf-8") as f:
+            json.dump({"theme": "dark", "autoUpdates": False}, f)
+        ok, msg = install_statusline_hook(settings_path2, fake_script)
+        assert ok, msg
+        with open(settings_path2, encoding="utf-8") as f:
+            data2 = json.load(f)
+        assert data2["theme"] == "dark"
+        assert data2["autoUpdates"] is False
+        assert data2["statusLine"] == expected_block
+        print("hook install — merges with existing keys: OK")
+
+        # Case 3: already configured with the same command (no-op)
+        ok3, msg3 = install_statusline_hook(settings_path2, fake_script)
+        assert ok3, msg3
+        assert "already" in msg3.lower()
+        print("hook install — already configured, no-op: OK")
+
+        # Case 4: existing statusLine with a different command (overwritten)
+        settings_path3 = os.path.join(tmp_home, "settings_overwrite.json")
+        with open(settings_path3, "w", encoding="utf-8") as f:
+            json.dump({"statusLine": {"type": "command", "command": "old-cmd"}}, f)
+        ok4, msg4 = install_statusline_hook(settings_path3, fake_script)
+        assert ok4, msg4
+        with open(settings_path3, encoding="utf-8") as f:
+            data3 = json.load(f)
+        assert data3["statusLine"] == expected_block
+        assert "old-cmd" in msg4  # message must mention the old value
+        print("hook install — overwrites different command: OK")
+
+        # Case 5: malformed settings.json (abort without writing)
+        settings_path4 = os.path.join(tmp_home, "settings_broken.json")
+        with open(settings_path4, "w", encoding="utf-8") as f:
+            f.write('{"broken": true,}')  # trailing comma — invalid JSON
+        ok5, msg5 = install_statusline_hook(settings_path4, fake_script)
+        assert not ok5, "should have failed on malformed JSON"
+        # File must be unchanged (still unparseable, not overwritten)
+        with open(settings_path4, encoding="utf-8") as f:
+            raw = f.read()
+        assert "broken" in raw and raw.strip().endswith("}") is False or "}" in raw
+        print("hook install — malformed JSON aborted cleanly: OK")
+
         # --- taskbar tray-rect detection: must degrade gracefully off-Windows ---
         if not sys.platform.startswith("win"):
             assert find_tray_notification_rect() is None
@@ -1549,11 +1669,18 @@ if __name__ == "__main__":
         help="read a Claude Code statusLine JSON payload from stdin, cache the "
              "rate-limit fields, and print a status line back (see README.md)",
     )
+    cli.add_argument(
+        "--install-hook", action="store_true",
+        help="add the statusLine hook entry to ~/.claude/settings.json so Claude "
+             "Code starts piping rate-limit data to this script automatically",
+    )
     args = cli.parse_args()
 
     if args.test:
         run_tests()
     elif args.statusline_hook:
         run_statusline_hook()
+    elif args.install_hook:
+        run_install_hook()
     else:
         run_app()

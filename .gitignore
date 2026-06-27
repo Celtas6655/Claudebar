@@ -1,0 +1,16 @@
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor/OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

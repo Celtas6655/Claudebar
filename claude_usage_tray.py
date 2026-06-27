@@ -294,29 +294,382 @@ def pct_tag(pct):
     return "red"
 
 
-def find_tray_notification_rect():
-    """Best-effort lookup of Windows' taskbar notification area (where the
-    tray icons live), in screen pixels: {'left', 'top', 'height'}.
-    Returns None on non-Windows platforms, if pywin32 isn't installed, or
-    if the lookup fails for any reason -- callers must have a fallback."""
+# --------------------------------------------------------------------------
+# Taskbar alignment: configuration, diagnostics, and tray-rect detection.
+#
+# All coordinate-returning functions produce Win32 physical pixels.  On
+# modern Python 3.x + Windows 10/11 (per-monitor DPI aware), Tkinter's
+# geometry() also takes physical pixels, so no unit conversion is needed
+# between Win32 rect values and Tk geometry strings.
+#
+# Uses ctypes (stdlib) only -- pywin32 is no longer required.
+# --------------------------------------------------------------------------
+
+class TaskbarAlignmentConfig:
+    """Controls how the floating widget is anchored next to the system tray.
+
+    Attributes
+    ----------
+    enabled : bool
+        When True the widget is positioned (and periodically re-positioned)
+        left of the tray rather than at the last-dragged location.
+        Dragging the widget disables this mode automatically.
+    gap_px : int
+        Clear space between the widget's right edge and the tray's left edge.
+    vertical_mode : str
+        "inside-taskbar" — widget is vertically centred on the taskbar.
+        "above-taskbar" — widget floats above the taskbar top edge.
+    vertical_offset_px : int
+        Additional vertical nudge (positive = downward).
+    overlap_px : int
+        For "above-taskbar" mode: pixels of overlap with the taskbar top.
+    fallback_reserved_tray_width_px : int
+        When no tray child window can be located, treat this many pixels at
+        the taskbar's right end as the tray area (logged loudly when used).
+    debug_logging : bool
+        Print a full diagnostic tree on startup and log all alignment
+        decisions.  Enable via the TRAY_DEBUG=1 environment variable.
+    """
+
+    def __init__(self):
+        self.enabled = True
+        self.gap_px = 8
+        self.vertical_mode = "inside-taskbar"
+        self.vertical_offset_px = 0
+        self.overlap_px = 0
+        self.fallback_reserved_tray_width_px = 300
+        self.debug_logging = os.environ.get("TRAY_DEBUG") == "1"
+
+
+def _taskbar_log(msg, config=None):
+    """Print msg if config.debug_logging is True (or config is None)."""
+    if config is None or config.debug_logging:
+        print(f"[taskbar] {msg}", flush=True)
+
+
+def _w32_class_name(hwnd):
+    """GetClassNameW → string.  Returns '' on failure."""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def _w32_window_text(hwnd):
+    """GetWindowTextW → string.  Returns '' on failure."""
+    try:
+        import ctypes
+        n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        if n == 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(n + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, n + 1)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def _w32_get_rect(hwnd):
+    """GetWindowRect → (left, top, right, bottom) in physical pixels, or None."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        r = ctypes.wintypes.RECT()
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+        return (r.left, r.top, r.right, r.bottom)
+    except Exception:
+        return None
+
+
+def _w32_enum_children(parent_hwnd):
+    """EnumChildWindows → list of all child HWNDs (recursive), or []."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        children = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM,
+        )
+        def _cb(hwnd, _lparam):
+            children.append(hwnd)
+            return True
+        cb = WNDENUMPROC(_cb)
+        ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
+        return children
+    except Exception:
+        return []
+
+
+def _w32_find_window(cls, title=None):
+    """FindWindowW → HWND (int) or 0."""
+    try:
+        import ctypes
+        return ctypes.windll.user32.FindWindowW(cls, title) or 0
+    except Exception:
+        return 0
+
+
+def diagnose_taskbar_windows(config=None):
+    """Walk the Shell_TrayWnd child tree and log every window's class/text/rect.
+
+    Returns a list of dicts (hwnd, class, text, rect, width, height) for every
+    window in the tree.  Always safe to call; returns [] on non-Windows.
+    Logging output is suppressed unless config.debug_logging is True.
+
+    Classes looked for specifically:
+      TrayNotifyWnd, SysPager, ToolbarWindow32, ReBarWindow32,
+      MSTaskSwWClass, Shell_SecondaryTrayWnd, ClockButton,
+      TrayShowDesktopButtonWClass
+    """
+    result = []
+    if not sys.platform.startswith("win"):
+        return result
+
+    taskbar_hwnd = _w32_find_window("Shell_TrayWnd")
+    if not taskbar_hwnd:
+        _taskbar_log("diagnose: Shell_TrayWnd not found", config)
+        return result
+
+    rect = _w32_get_rect(taskbar_hwnd)
+    result.append({
+        "hwnd": taskbar_hwnd, "class": "Shell_TrayWnd",
+        "text": _w32_window_text(taskbar_hwnd), "rect": rect,
+        "width": (rect[2] - rect[0]) if rect else None,
+        "height": (rect[3] - rect[1]) if rect else None,
+    })
+    _taskbar_log(f"Shell_TrayWnd hwnd=0x{taskbar_hwnd:08X}  rect={rect}", config)
+
+    children = _w32_enum_children(taskbar_hwnd)
+    _taskbar_log(f"  {len(children)} child window(s) under Shell_TrayWnd:", config)
+
+    INTERESTING = {
+        "TrayNotifyWnd", "SysPager", "ToolbarWindow32", "ReBarWindow32",
+        "MSTaskSwWClass", "Shell_SecondaryTrayWnd", "ClockButton",
+        "TrayShowDesktopButtonWClass",
+    }
+    for child in children:
+        cls = _w32_class_name(child)
+        text = _w32_window_text(child)
+        r = _w32_get_rect(child)
+        result.append({
+            "hwnd": child, "class": cls, "text": text, "rect": r,
+            "width": (r[2] - r[0]) if r else None,
+            "height": (r[3] - r[1]) if r else None,
+        })
+        if cls in INTERESTING:
+            _taskbar_log(
+                f"  0x{child:08X}  {cls:<32}  {text!r:<14}  rect={r}", config,
+            )
+    return result
+
+
+def find_taskbar_tray_rect(config=None):
+    """Locate the system tray notification area in Win32 physical pixels.
+
+    Strategy (each step falls through to the next on failure):
+      Taskbar rect:
+        1. SHAppBarMessage(ABM_GETTASKBARPOS) — authoritative.
+        2. GetWindowRect(Shell_TrayWnd) — fallback.
+      Tray rect (the notification / icon area at the right end):
+        3. TrayNotifyWnd child of Shell_TrayWnd.
+        4. SysPager child (Windows 10 sometimes restructures the tree).
+        5. Rightmost plausible child whose rect overlaps the taskbar.
+        6. taskbar.right − fallback_reserved_tray_width_px (logged loudly).
+
+    Returns a dict on success:
+        {
+          "taskbar_rect":  (l, t, r, b),   # whole taskbar, physical px
+          "tray_rect":     (l, t, r, b),   # notification area, physical px
+          "monitor_rect":  (l, t, r, b) | None,
+          "work_area":     (l, t, r, b) | None,
+          "tray_hwnd":     int,             # 0 when fallback was used
+          "tray_class":    str,
+          "fallback_used": bool,
+          "dpi":           int,
+          "source":        "SHAppBarMessage" | "FindWindow",
+        }
+    Returns None if Shell_TrayWnd can't be found at all.
+    """
     if not sys.platform.startswith("win"):
         return None
     try:
-        import win32gui
+        import ctypes
+        import ctypes.wintypes
     except ImportError:
         return None
-    try:
-        taskbar = win32gui.FindWindow("Shell_TrayWnd", None)
-        if not taskbar:
-            return None
-        notify = win32gui.FindWindowEx(taskbar, 0, "TrayNotifyWnd", None)
-        if not notify:
-            return None
-        left, _top, _right, _bottom = win32gui.GetWindowRect(notify)
-        _t_left, t_top, _t_right, t_bottom = win32gui.GetWindowRect(taskbar)
-        return {"left": left, "top": t_top, "height": t_bottom - t_top}
-    except Exception:
+
+    # 1. Taskbar HWND
+    taskbar_hwnd = _w32_find_window("Shell_TrayWnd")
+    if not taskbar_hwnd:
+        _taskbar_log("Shell_TrayWnd not found", config)
         return None
+    _taskbar_log(f"Shell_TrayWnd hwnd=0x{taskbar_hwnd:08X}", config)
+
+    # 2. Taskbar rect — prefer SHAppBarMessage
+    taskbar_rect = None
+    source = "FindWindow"
+    try:
+        class _ABD(ctypes.Structure):
+            _fields_ = [
+                ("cbSize",           ctypes.wintypes.DWORD),
+                ("hWnd",             ctypes.wintypes.HWND),
+                ("uCallbackMessage", ctypes.wintypes.UINT),
+                ("uEdge",            ctypes.wintypes.UINT),
+                ("rc",               ctypes.wintypes.RECT),
+                ("lParam",           ctypes.wintypes.LPARAM),
+            ]
+        abd = _ABD()
+        abd.cbSize = ctypes.sizeof(_ABD)
+        abd.hWnd = taskbar_hwnd
+        if ctypes.windll.shell32.SHAppBarMessage(0x00000005, ctypes.byref(abd)):
+            r = abd.rc
+            taskbar_rect = (r.left, r.top, r.right, r.bottom)
+            source = "SHAppBarMessage"
+            _taskbar_log(f"Taskbar rect via SHAppBarMessage: {taskbar_rect}", config)
+    except Exception as exc:
+        _taskbar_log(f"SHAppBarMessage failed ({exc}), using GetWindowRect", config)
+
+    if not taskbar_rect:
+        taskbar_rect = _w32_get_rect(taskbar_hwnd)
+        _taskbar_log(f"Taskbar rect via GetWindowRect: {taskbar_rect}", config)
+    if not taskbar_rect:
+        return None
+
+    # 3. DPI for the taskbar window
+    dpi = 96
+    try:
+        dpi = ctypes.windll.user32.GetDpiForWindow(taskbar_hwnd)
+    except Exception:
+        try:
+            hdc = ctypes.windll.user32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+        except Exception:
+            pass
+    _taskbar_log(f"DPI={dpi} ({dpi / 96 * 100:.0f}%)", config)
+
+    # 4. Monitor info (best-effort; not fatal if unavailable)
+    monitor_rect = work_area = None
+    try:
+        hmon = ctypes.windll.user32.MonitorFromRect(
+            ctypes.byref(ctypes.wintypes.RECT(*taskbar_rect)), 2,  # MONITOR_DEFAULTTONEAREST
+        )
+        if hmon:
+            class _MI(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize",    ctypes.wintypes.DWORD),
+                    ("rcMonitor", ctypes.wintypes.RECT),
+                    ("rcWork",    ctypes.wintypes.RECT),
+                    ("dwFlags",   ctypes.wintypes.DWORD),
+                ]
+            mi = _MI()
+            mi.cbSize = ctypes.sizeof(_MI)
+            ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi))
+            r = mi.rcMonitor
+            monitor_rect = (r.left, r.top, r.right, r.bottom)
+            r = mi.rcWork
+            work_area = (r.left, r.top, r.right, r.bottom)
+            _taskbar_log(f"Monitor={monitor_rect}  WorkArea={work_area}", config)
+    except Exception as exc:
+        _taskbar_log(f"GetMonitorInfo failed: {exc}", config)
+
+    # 5. Find the tray child rect
+    children = _w32_enum_children(taskbar_hwnd)
+    tray_hwnd, tray_rect, tray_class, fallback_used = 0, None, "", False
+
+    # Priority 1: TrayNotifyWnd — canonical location of the notification area
+    for child in children:
+        if _w32_class_name(child) == "TrayNotifyWnd":
+            r = _w32_get_rect(child)
+            if r:
+                tray_hwnd, tray_rect, tray_class = child, r, "TrayNotifyWnd"
+                _taskbar_log(
+                    f"TrayNotifyWnd hwnd=0x{child:08X}  rect={r}", config,
+                )
+                break
+
+    # Priority 2: SysPager (sometimes the direct host on older Windows builds)
+    if not tray_rect:
+        for child in children:
+            if _w32_class_name(child) == "SysPager":
+                r = _w32_get_rect(child)
+                if r:
+                    tray_hwnd, tray_rect, tray_class = child, r, "SysPager"
+                    _taskbar_log(
+                        f"SysPager (stand-in) hwnd=0x{child:08X}  rect={r}", config,
+                    )
+                    break
+
+    # Priority 3: rightmost child that plausibly overlaps the right end of the taskbar
+    if not tray_rect:
+        tb_right = taskbar_rect[2]
+        best_hwnd, best_rect, best_cls, best_right = 0, None, "", -1
+        for child in children:
+            r = _w32_get_rect(child)
+            if not r:
+                continue
+            if r[2] < tb_right - 600:          # too far left to be the tray
+                continue
+            if r[3] < taskbar_rect[1] or r[1] > taskbar_rect[3]:  # no vertical overlap
+                continue
+            if r[2] > best_right:
+                best_hwnd, best_rect, best_cls = child, r, _w32_class_name(child)
+                best_right = r[2]
+        if best_rect:
+            tray_hwnd, tray_rect, tray_class = best_hwnd, best_rect, best_cls
+            _taskbar_log(
+                f"Using rightmost child hwnd=0x{best_hwnd:08X}  "
+                f"class={best_cls!r}  rect={best_rect}",
+                config,
+            )
+
+    # Priority 4: synthetic reserved-width fallback (logged loudly)
+    if not tray_rect:
+        fallback_used = True
+        fw = config.fallback_reserved_tray_width_px if config else 300
+        tray_rect = (
+            taskbar_rect[2] - fw, taskbar_rect[1],
+            taskbar_rect[2],      taskbar_rect[3],
+        )
+        _taskbar_log(
+            f"WARNING: no tray child found — using fallback reserved_width={fw}px  "
+            f"synthetic_tray_rect={tray_rect}",
+            config,
+        )
+
+    _taskbar_log(
+        f"Result: source={source!r}  taskbar={taskbar_rect}  tray={tray_rect}  "
+        f"tray_class={tray_class!r}  dpi={dpi}  fallback={fallback_used}",
+        config,
+    )
+    return {
+        "taskbar_rect": taskbar_rect,
+        "tray_rect":    tray_rect,
+        "monitor_rect": monitor_rect,
+        "work_area":    work_area,
+        "tray_hwnd":    tray_hwnd,
+        "tray_class":   tray_class,
+        "fallback_used": fallback_used,
+        "dpi":          dpi,
+        "source":       source,
+    }
+
+
+def find_tray_notification_rect():
+    """Thin backward-compatible wrapper around find_taskbar_tray_rect().
+    Returns {"left", "top", "height"} or None.
+    New callers should use find_taskbar_tray_rect() directly."""
+    if not sys.platform.startswith("win"):
+        return None
+    info = find_taskbar_tray_rect()
+    if not info:
+        return None
+    tray = info["tray_rect"]
+    tb   = info["taskbar_rect"]
+    return {"left": tray[0], "top": tb[1], "height": tb[3] - tb[1]}
 
 
 # --------------------------------------------------------------------------
@@ -412,6 +765,11 @@ def run_app():
     FALLBACK_SWEEP_SECONDS = 30   # safety-net full rescan interval
     WATCHER_RETRY_SECONDS = 5     # retry interval if projects dir doesn't exist yet
     WIDGET_POS_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_pos.json")
+    ALIGNMENT_CONFIG_PATH = os.path.join(CLAUDE_HOME, "usage_tray_alignment.json")
+
+    ALIGNMENT_CONFIG = TaskbarAlignmentConfig()
+    _saved_align = read_usage_cache(cache_path=ALIGNMENT_CONFIG_PATH) or {}
+    ALIGNMENT_CONFIG.enabled = _saved_align.get("enabled", True)
     WIDGET_COLORS = {
         "green": "#5fb85f", "yellow": "#e0b341", "red": "#e0605a", "dim": "#888888",
     }
@@ -446,66 +804,121 @@ def run_app():
             self.root.overrideredirect(True)
             self.root.attributes("-topmost", True)
             try:
-                self.root.attributes("-alpha", 0.92)
+                self.root.attributes("-alpha", 0.3)
             except tk.TclError:
                 pass
             self.root.configure(bg=self.BG)
 
-            frame = tk.Frame(self.root, bg=self.BG, padx=10, pady=8)
+            # 2-row layout: today on row 1, session+weekly combined on row 2.
+            # 2 rows of 9pt Consolas always fit in any standard taskbar (40\u201360px)
+            # without font scaling.  Row 2 is wider than a single metric row was,
+            # which is what makes the widget "wider" to compensate for being shorter.
+            import tkinter.font as tkfont
+            _tb_info = find_taskbar_tray_rect(ALIGNMENT_CONFIG)
+            _tb_h = ((_tb_info["taskbar_rect"][3] - _tb_info["taskbar_rect"][1])
+                     if _tb_info else 48)   # 48px: Win11 @ 100% DPI fallback
+            self._tb_h = _tb_h
+            for _fs in (9, 8, 7, 6):
+                _lh = tkfont.Font(family="Consolas", size=_fs).metrics("linespace")
+                if 2 * _lh <= _tb_h:
+                    break
+            self._fs = _fs
+            self.BAR_H = max(4, min(10, _lh - 2))   # shadows class-level BAR_H
+            self.BAR_W = 65                           # shadows class-level BAR_W=90
+            _slack        = max(0, _tb_h - 2 * _lh)
+            _frame_pady   = min(4, _slack // 4)
+            _slack       -= 2 * _frame_pady
+            _today_pady   = min(2, _slack // 3)
+            _slack       -= 2 * _today_pady
+            self._row_pady = min(1, _slack // 4)
+
+            frame = tk.Frame(self.root, bg=self.BG, padx=10, pady=_frame_pady)
             frame.pack(fill="both", expand=True)
 
-            title_row = tk.Frame(frame, bg=self.BG)
-            title_row.pack(fill="x")
-            tk.Label(
-                title_row, text="Claude Code", font=("Consolas", 9, "bold"),
-                fg=self.FG, bg=self.BG,
-            ).pack(side="left")
-            close_btn = tk.Label(
-                title_row, text="\u2715", font=("Consolas", 9, "bold"),
-                fg=self.DIM, bg=self.BG, cursor="hand2",
-            )
-            close_btn.pack(side="right")
-            close_btn.bind("<Button-1>", lambda e: widget_visible.clear())
-
             self.today_label = tk.Label(
-                frame, font=("Consolas", 9), fg=self.FG, bg=self.BG, anchor="w",
+                frame, font=("Consolas", _fs), fg=self.FG, bg=self.BG, anchor="w",
             )
-            self.today_label.pack(fill="x", pady=(4, 4))
+            self.today_label.pack(fill="x", pady=(_today_pady, _today_pady))
 
-            self.session_canvas, self.session_pct_lbl, self.session_reset_lbl, session_row = (
-                self._build_metric_row(frame, "Session 5h")
-            )
-            self.weekly_canvas, self.weekly_pct_lbl, self.weekly_reset_lbl, weekly_row = (
-                self._build_metric_row(frame, "Weekly  7d")
-            )
+            # Single row: session 5h and weekly 7d side-by-side
+            metrics_row = tk.Frame(frame, bg=self.BG)
+            metrics_row.pack(fill="x", pady=self._row_pady)
 
-            for w in (self.root, frame, title_row, self.today_label, session_row, weekly_row):
+            tk.Label(metrics_row, text="5h", font=("Consolas", _fs), fg=self.FG, bg=self.BG,
+                     ).pack(side="left", padx=(0, 4))
+            self.session_canvas = tk.Canvas(
+                metrics_row, width=self.BAR_W, height=self.BAR_H, bg=self.BG, highlightthickness=0,
+            )
+            self.session_canvas.pack(side="left", padx=(0, 4))
+            self.session_pct_lbl = tk.Label(
+                metrics_row, font=("Consolas", _fs, "bold"), bg=self.BG, width=4, anchor="e",
+            )
+            self.session_pct_lbl.pack(side="left")
+            self.session_reset_lbl = tk.Label(
+                metrics_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG, anchor="w",
+            )
+            self.session_reset_lbl.pack(side="left", padx=(4, 10))
+
+            tk.Label(metrics_row, text="\u00b7", font=("Consolas", _fs), fg=self.DIM, bg=self.BG,
+                     ).pack(side="left", padx=(0, 10))
+
+            tk.Label(metrics_row, text="7d", font=("Consolas", _fs), fg=self.FG, bg=self.BG,
+                     ).pack(side="left", padx=(0, 4))
+            self.weekly_canvas = tk.Canvas(
+                metrics_row, width=self.BAR_W, height=self.BAR_H, bg=self.BG, highlightthickness=0,
+            )
+            self.weekly_canvas.pack(side="left", padx=(0, 4))
+            self.weekly_pct_lbl = tk.Label(
+                metrics_row, font=("Consolas", _fs, "bold"), bg=self.BG, width=4, anchor="e",
+            )
+            self.weekly_pct_lbl.pack(side="left")
+            self.weekly_reset_lbl = tk.Label(
+                metrics_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG, anchor="w",
+            )
+            self.weekly_reset_lbl.pack(side="left", padx=(4, 0))
+
+            for w in (self.root, frame, self.today_label, metrics_row):
                 w.bind("<Button-1>", self._start_drag)
                 w.bind("<B1-Motion>", self._do_drag)
                 w.bind("<ButtonRelease-1>", self._end_drag)
 
             self._drag_offset = (0, 0)
+            self._last_alignment_check = 0.0
+            self._topmost_hwnd = None  # resolved on first _reassert_topmost call
+            self._dragging = False
+            # WS_EX_NOACTIVATE: clicking the widget delivers mouse events but does
+            # NOT activate the window or change the foreground window.  Without this,
+            # every click triggers a focus/activation event that causes the taskbar
+            # (also HWND_TOPMOST) to re-promote itself in z-order, pushing the widget
+            # behind it.  Apply to both inner and outer HWNDs in case they differ.
+            if sys.platform.startswith("win"):
+                try:
+                    import ctypes
+                    GWL_EXSTYLE      = -20
+                    WS_EX_NOACTIVATE = 0x08000000
+                    _inner = self.root.winfo_id()
+                    _outer = ctypes.windll.user32.GetAncestor(_inner, 2) or _inner
+                    for _hwnd in {_inner, _outer} - {0}:
+                        _es = ctypes.windll.user32.GetWindowLongW(_hwnd, GWL_EXSTYLE)
+                        ctypes.windll.user32.SetWindowLongW(_hwnd, GWL_EXSTYLE,
+                                                            _es | WS_EX_NOACTIVATE)
+                except Exception:
+                    pass
             self._render()                  # render real content first...
             self.root.update_idletasks()    # ...so reqwidth/reqheight reflect it...
             self._place_initial()           # ...before sizing/positioning the window.
+            self._set_transparent(True)
+            self.root.after(200, self._fast_tick)
             self.root.after(1000, self._tick)
 
-        def _build_metric_row(self, parent, name):
-            row = tk.Frame(parent, bg=self.BG)
-            row.pack(fill="x", pady=2)
-            tk.Label(
-                row, text=name, font=("Consolas", 9), fg=self.FG, bg=self.BG,
-                width=10, anchor="w",
-            ).pack(side="left")
-            canvas = tk.Canvas(
-                row, width=self.BAR_W, height=self.BAR_H, bg=self.BG, highlightthickness=0,
-            )
-            canvas.pack(side="left", padx=(0, 6))
-            pct_lbl = tk.Label(row, font=("Consolas", 9, "bold"), bg=self.BG, width=4, anchor="e")
-            pct_lbl.pack(side="left")
-            reset_lbl = tk.Label(row, font=("Consolas", 9), fg=self.DIM, bg=self.BG, anchor="w")
-            reset_lbl.pack(side="left", padx=(6, 0))
-            return canvas, pct_lbl, reset_lbl, row
+        def _set_transparent(self, on):
+            """on=True → idle alpha (0.1, nearly invisible).
+            on=False → drag alpha (0.92, dark panel fully visible).
+            Hover alpha (0.75) is driven by _fast_tick polling mouse position."""
+            try:
+                self.root.attributes("-alpha", 0.1 if on else 0.92)
+            except tk.TclError:
+                pass
 
         def _draw_bar(self, canvas, pct):
             canvas.delete("all")
@@ -520,10 +933,10 @@ def run_app():
             self._draw_bar(canvas, pct)
             if pct is not None:
                 pct_lbl.config(text=f"{pct:.0f}%", fg=WIDGET_COLORS[pct_tag(pct)])
-                reset_lbl.config(text=f"resets {fmt_reset_clock(resets_at) or '?'}", fg=self.DIM)
+                reset_lbl.config(text=fmt_reset_clock(resets_at) or "?", fg=self.DIM)
             else:
                 pct_lbl.config(text="--", fg=self.DIM)
-                reset_lbl.config(text="(needs statusLine hook)", fg=self.DIM)
+                reset_lbl.config(text="--", fg=self.DIM)
 
         def _render(self):
             snap = current_snapshot()
@@ -541,10 +954,75 @@ def run_app():
                 cache.get("weekly_used_percentage"), cache.get("weekly_resets_at"),
             )
 
+        def _compute_aligned_position(self, w, h, info):
+            """Return (x, y) in physical pixels for the aligned position.
+
+            Applies the gap, vertical mode, and monitor-clamp from
+            ALIGNMENT_CONFIG.  All values are physical-pixel coordinates
+            matching the Win32 rects returned by find_taskbar_tray_rect().
+            """
+            tray = info["tray_rect"]
+            tb   = info["taskbar_rect"]
+            mon  = info.get("monitor_rect") or tb
+
+            x = tray[0] - w - ALIGNMENT_CONFIG.gap_px
+
+            if ALIGNMENT_CONFIG.vertical_mode == "inside-taskbar":
+                tb_h = tb[3] - tb[1]
+                y = tb[1] + (tb_h - h) // 2 + ALIGNMENT_CONFIG.vertical_offset_px
+            else:  # "above-taskbar"
+                y = (tb[1] - h
+                     + ALIGNMENT_CONFIG.overlap_px
+                     + ALIGNMENT_CONFIG.vertical_offset_px)
+
+            # Clamp so the widget stays within the monitor
+            x = max(mon[0], min(x, mon[2] - w))
+            y = max(mon[1], min(y, mon[3] - h))
+
+            _taskbar_log(
+                f"aligned position: {w}x{h}+{x}+{y}  tray_left={tray[0]}  "
+                f"gap={ALIGNMENT_CONFIG.gap_px}  tb={tb[1]}-{tb[3]}",
+                ALIGNMENT_CONFIG,
+            )
+            return x, y
+
+        def _recheck_alignment(self):
+            """Recompute and apply the aligned position (called from _tick).
+
+            Uses the actual rendered window size (winfo_width/height) rather
+            than the requisition size, so it stays correct after any resize.
+            Repositions via geometry() without altering the window size.
+            """
+            self._last_alignment_check = time.monotonic()
+            info = find_taskbar_tray_rect(ALIGNMENT_CONFIG)
+            if not info:
+                return
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            if w < 1 or h < 1:
+                w, h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
+            x, y = self._compute_aligned_position(w, h, info)
+            self.root.geometry(f"+{int(x)}+{int(y)}")
+
         def _place_initial(self):
-            saved = read_usage_cache(cache_path=WIDGET_POS_PATH)
             w = self.root.winfo_reqwidth()
             h = self.root.winfo_reqheight()
+
+            if ALIGNMENT_CONFIG.enabled:
+                if ALIGNMENT_CONFIG.debug_logging:
+                    diagnose_taskbar_windows(ALIGNMENT_CONFIG)
+                info = find_taskbar_tray_rect(ALIGNMENT_CONFIG)
+                if info:
+                    self._last_alignment_check = time.monotonic()
+                    x, y = self._compute_aligned_position(w, h, info)
+                    self.root.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
+                    return
+                _taskbar_log(
+                    "alignment enabled but taskbar not found — using saved/heuristic",
+                    ALIGNMENT_CONFIG,
+                )
+
+            saved = read_usage_cache(cache_path=WIDGET_POS_PATH)
             if saved and saved.get("x") is not None and saved.get("y") is not None:
                 x, y = saved["x"], saved["y"]
             else:
@@ -552,16 +1030,11 @@ def run_app():
             self.root.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
 
         def _default_position(self, w, h):
-            """On first run (no saved drag position), try to sit just to
-            the left of the real taskbar notification area (where the
-            tray icons live). Falls back to a screen-corner estimate if
-            that can't be detected (non-Windows, pywin32 missing, or the
-            lookup fails for any reason)."""
-            tray = find_tray_notification_rect()
-            if tray:
-                x = tray["left"] - w - 8
-                y = tray["top"] + (tray["height"] - h) // 2
-                return x, y
+            """Heuristic fallback when alignment is off and no drag position is saved.
+            Tries the tray rect first; falls back to a screen-corner estimate."""
+            info = find_taskbar_tray_rect(ALIGNMENT_CONFIG)
+            if info:
+                return self._compute_aligned_position(w, h, info)
             sw = self.root.winfo_screenwidth()
             sh = self.root.winfo_screenheight()
             return sw - w - 220, sh - h - 50
@@ -571,6 +1044,8 @@ def run_app():
                 event.x_root - self.root.winfo_x(),
                 event.y_root - self.root.winfo_y(),
             )
+            self._dragging = True
+            self._set_transparent(False)
 
         def _do_drag(self, event):
             x = event.x_root - self._drag_offset[0]
@@ -578,10 +1053,89 @@ def run_app():
             self.root.geometry(f"+{x}+{y}")
 
         def _end_drag(self, event):
+            # Dragging disables alignment so the widget stays where the user puts it.
+            # Re-enable via the tray menu "Align to taskbar tray" item.
+            if ALIGNMENT_CONFIG.enabled:
+                ALIGNMENT_CONFIG.enabled = False
+                write_usage_cache({"enabled": False}, cache_path=ALIGNMENT_CONFIG_PATH)
             write_usage_cache(
                 {"x": self.root.winfo_x(), "y": self.root.winfo_y()},
                 cache_path=WIDGET_POS_PATH,
             )
+            self._dragging = False
+            # Stay at hover alpha if mouse is still over the widget; else go idle.
+            mx, my = event.x_root, event.y_root
+            wx = self.root.winfo_rootx()
+            wy = self.root.winfo_rooty()
+            ww = self.root.winfo_width()
+            wh = self.root.winfo_height()
+            try:
+                self.root.attributes(
+                    "-alpha", 0.75 if wx <= mx < wx + ww and wy <= my < wy + wh else 0.1
+                )
+            except tk.TclError:
+                pass
+
+        def _reassert_topmost(self):
+            """Re-assert HWND_TOPMOST z-order via SetWindowPos.
+
+            Tkinter's -topmost True sets the flag once at init, but the Windows
+            taskbar is itself HWND_TOPMOST.  When the user clicks the taskbar,
+            Windows re-promotes it to the front of the topmost layer and our
+            widget ends up behind it.
+
+            Critical: winfo_id() returns Tk's *inner* drawing-surface HWND (a
+            child window).  SetWindowPos z-order only works on top-level windows.
+            We must call GetAncestor(GA_ROOT=2) to reach the outer wrapper HWND
+            that Tkinter's own -topmost attribute targets internally.  Calling
+            SetWindowPos on the inner HWND silently succeeds but does nothing to
+            z-order, which is why the earlier implementation had no effect.
+            """
+            if not sys.platform.startswith("win"):
+                return
+            try:
+                import ctypes
+                if self._topmost_hwnd is None:
+                    inner = self.root.winfo_id()
+                    # GA_ROOT=2: walk the parent chain to the true top-level window
+                    wrapper = ctypes.windll.user32.GetAncestor(inner, 2)
+                    self._topmost_hwnd = wrapper or inner
+                    _taskbar_log(
+                        f"topmost HWND resolved: inner=0x{inner:08X}  "
+                        f"wrapper=0x{self._topmost_hwnd:08X}",
+                        ALIGNMENT_CONFIG,
+                    )
+                # HWND_TOPMOST = -1
+                # SWP_NOSIZE=0x0001 | SWP_NOMOVE=0x0002 | SWP_NOACTIVATE=0x0010
+                ctypes.windll.user32.SetWindowPos(
+                    self._topmost_hwnd, -1, 0, 0, 0, 0, 0x0013,
+                )
+            except Exception:
+                pass
+
+        def _fast_tick(self):
+            """Runs every 200ms: reasserts topmost z-order and drives hover alpha.
+
+            Reasserting every 200ms means the widget recovers within one blink
+            even if the taskbar temporarily wins the HWND_TOPMOST z-order battle.
+            Hover alpha: 0.75 when mouse is inside the widget, 0.1 when outside.
+            """
+            if should_quit.is_set():
+                return
+            self._reassert_topmost()
+            if widget_visible.is_set() and not self._dragging:
+                try:
+                    mx = self.root.winfo_pointerx()
+                    my = self.root.winfo_pointery()
+                    wx = self.root.winfo_rootx()
+                    wy = self.root.winfo_rooty()
+                    ww = self.root.winfo_width()
+                    wh = self.root.winfo_height()
+                    inside = wx <= mx < wx + ww and wy <= my < wy + wh
+                    self.root.attributes("-alpha", 0.75 if inside else 0.1)
+                except tk.TclError:
+                    pass
+            self.root.after(200, self._fast_tick)
 
         def _tick(self):
             if should_quit.is_set():
@@ -590,7 +1144,15 @@ def run_app():
             if widget_visible.is_set():
                 if not self.root.winfo_viewable():
                     self.root.deiconify()
+                    self._set_transparent(True)
                 self._render()
+                self._reassert_topmost()
+                # Periodically re-align to the tray (handles taskbar moves, DPI changes,
+                # monitor layout changes, and tray overflow expand/collapse).
+                if ALIGNMENT_CONFIG.enabled:
+                    now = time.monotonic()
+                    if now - self._last_alignment_check > 30.0:
+                        self._recheck_alignment()
             else:
                 self.root.withdraw()
             self.root.after(1000, self._tick)
@@ -690,6 +1252,11 @@ def run_app():
             on_toggle_widget,
             checked=lambda item: widget_visible.is_set(),
         ))
+        items.append(pystray.MenuItem(
+            "Align to taskbar tray",
+            on_toggle_alignment,
+            checked=lambda item: ALIGNMENT_CONFIG.enabled,
+        ))
         items.append(pystray.MenuItem("Refresh now", on_refresh))
         items.append(pystray.MenuItem("Open logs folder", on_open_folder))
         items.append(pystray.MenuItem("Quit", on_quit))
@@ -712,6 +1279,10 @@ def run_app():
                 os.startfile(PROJECTS_DIR)  # noqa: S606
             else:
                 subprocess.Popen(["xdg-open", PROJECTS_DIR])
+
+    def on_toggle_alignment(icon, item):
+        ALIGNMENT_CONFIG.enabled = not ALIGNMENT_CONFIG.enabled
+        write_usage_cache({"enabled": ALIGNMENT_CONFIG.enabled}, cache_path=ALIGNMENT_CONFIG_PATH)
 
     def on_quit(icon, item):
         should_quit.set()

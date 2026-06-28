@@ -865,11 +865,6 @@ def run_app():
         def __init__(self):
             self.root = tk.Tk()
             self.root.overrideredirect(True)
-            self.root.attributes("-topmost", True)
-            try:
-                self.root.attributes("-alpha", 0.3)
-            except tk.TclError:
-                pass
             self.root.configure(bg=self.BG)
 
             # 2-row layout: today on row 1, session+weekly combined on row 2.
@@ -941,39 +936,128 @@ def run_app():
             self._last_alignment_check = 0.0
             self._topmost_hwnd = None  # resolved on first _reassert_topmost call
             self._dragging = False
-            # WS_EX_NOACTIVATE: clicking the widget delivers mouse events but does
-            # NOT activate the window or change the foreground window.  Without this,
-            # every click triggers a focus/activation event that causes the taskbar
-            # (also HWND_TOPMOST) to re-promote itself in z-order, pushing the widget
-            # behind it.  Apply to both inner and outer HWNDs in case they differ.
-            if sys.platform.startswith("win"):
-                try:
-                    import ctypes
-                    GWL_EXSTYLE      = -20
-                    WS_EX_NOACTIVATE = 0x08000000
-                    _inner = self.root.winfo_id()
-                    _outer = ctypes.windll.user32.GetAncestor(_inner, 2) or _inner
-                    for _hwnd in {_inner, _outer} - {0}:
-                        _es = ctypes.windll.user32.GetWindowLongW(_hwnd, GWL_EXSTYLE)
-                        ctypes.windll.user32.SetWindowLongW(_hwnd, GWL_EXSTYLE,
-                                                            _es | WS_EX_NOACTIVATE)
-                except Exception:
-                    pass
+            self._win_event_hook = None   # WinEventHook handle (Windows only)
+            self._win_event_proc = None   # keep reference — ctypes GC will break the hook
+            self._overlay_hwnd = None     # resolved by _apply_overlay_styles()
             self._render()                  # render real content first...
             self.root.update_idletasks()    # ...so reqwidth/reqheight reflect it...
             self._place_initial()           # ...before sizing/positioning the window.
+            self.root.update_idletasks()    # flush geometry to Win32 before style changes
+            self._apply_overlay_styles()    # atomic Win32 layered-overlay setup
             self._set_transparent(True)
-            self.root.after(200, self._fast_tick)
+            self.root.after(150, self._fast_tick)
             self.root.after(1000, self._tick)
 
-        def _set_transparent(self, on):
-            """on=True → idle alpha (0.1, nearly invisible).
-            on=False → drag alpha (0.92, dark panel fully visible).
-            Hover alpha (0.75) is driven by _fast_tick polling mouse position."""
+        def _apply_overlay_styles(self):
+            """Apply WS_EX_LAYERED + WS_EX_TOPMOST + WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE
+            atomically, then configure LWA_COLORKEY+LWA_ALPHA for per-pixel
+            transparency and promote z-order via SetWindowPos(HWND_TOPMOST).
+            All in one place so there is exactly one WM_STYLECHANGED, not three."""
+            if not sys.platform.startswith("win"):
+                return
             try:
-                self.root.attributes("-alpha", 0.1 if on else 0.92)
-            except tk.TclError:
-                pass
+                import ctypes
+                import ctypes.wintypes
+                GWL_EXSTYLE      = -20
+                WS_EX_LAYERED    = 0x00080000
+                WS_EX_TOOLWINDOW = 0x00000080
+                WS_EX_NOACTIVATE = 0x08000000
+                LWA_ALPHA        = 0x2
+
+                inner = self.root.winfo_id()
+                outer = ctypes.windll.user32.GetAncestor(inner, 2) or inner
+                self._overlay_hwnd = outer
+                self._topmost_hwnd = outer  # used by _reassert_topmost
+
+                # ONE SetWindowLongW — avoids the WM_STYLECHANGED storm that the
+                # old code caused by calling it separately for each style bit.
+                # WS_EX_TOPMOST is intentionally NOT set here; SetWindowPos manages it.
+                cur = ctypes.windll.user32.GetWindowLongW(outer, GWL_EXSTYLE)
+                ctypes.windll.user32.SetWindowLongW(
+                    outer, GWL_EXSTYLE,
+                    cur | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                )
+
+                # Global alpha transparency.  alpha=1 here is a placeholder —
+                # _set_transparent(True) is called immediately after this method
+                # and sets the real idle opacity (25 ≈ 10%).
+                ctypes.windll.user32.SetLayeredWindowAttributes(
+                    outer, 0, 1, LWA_ALPHA,
+                )
+
+                # Schedule NOTOPMOST→TOPMOST for the first mainloop iteration.
+                # We do NOT call root.attributes("-topmost", True) here because
+                # that call goes through Tk's WM machinery and triggers a
+                # SetWindowPos internally, which (while the geometry from
+                # _place_initial is still being committed) cancels the pending
+                # window move and leaves the widget stuck at (0, 0).
+                # The after(0) fires after the geometry is fully applied.
+                self.root.after(0, self._reassert_topmost)
+
+                # Event-driven z-order recovery: fires when any window becomes
+                # foreground (e.g. user clicks taskbar).  WINEVENT_OUTOFCONTEXT=0
+                # routes the callback through our message queue — no in-process DLL.
+                _WinEventProc = ctypes.WINFUNCTYPE(
+                    None,
+                    ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
+                    ctypes.wintypes.HWND,   ctypes.wintypes.LONG,
+                    ctypes.wintypes.LONG,   ctypes.wintypes.DWORD,
+                    ctypes.wintypes.DWORD,
+                )
+                def _on_foreground_change(_h, _e, _w, _o, _c, _t, _ms):
+                    self._reassert_topmost()
+                self._win_event_proc = _WinEventProc(_on_foreground_change)
+                self._win_event_hook = ctypes.windll.user32.SetWinEventHook(
+                    0x0003, 0x0003, None, self._win_event_proc,
+                    0, 0, 0x0000,
+                )
+
+                # Diagnostic: always printed so the user can verify with Spy++
+                exstyle = ctypes.windll.user32.GetWindowLongW(outer, GWL_EXSTYLE)
+                win_rect = _w32_get_rect(outer)
+                tb_info  = find_taskbar_tray_rect()
+                dpi = 96
+                try:
+                    dpi = ctypes.windll.user32.GetDpiForWindow(outer)
+                except Exception:
+                    pass
+                print(f"[overlay] inner=0x{inner:08X}  outer(HWND)=0x{outer:08X}")
+                print(
+                    f"[overlay] exstyle=0x{exstyle:08X}"
+                    f"  WS_EX_LAYERED={bool(exstyle & 0x80000)}"
+                    f"  WS_EX_TOPMOST={bool(exstyle & 0x8)}"
+                    f"  WS_EX_TOOLWINDOW={bool(exstyle & 0x80)}"
+                )
+                print(f"[overlay] window_rect={win_rect}  dpi={dpi}")
+                if tb_info:
+                    print(f"[overlay] taskbar_rect={tb_info['taskbar_rect']}")
+                    print(f"[overlay] tray_rect={tb_info['tray_rect']}")
+                # Log z-order at init (note: window not yet shown, so this is
+                # the pre-mainloop snapshot — after(0) will reassert and log again)
+                print(f"[overlay] init zorder vs taskbar: {self._zorder_vs_taskbar()}")
+            except Exception as exc:
+                print(f"[overlay] WARNING: failed to apply overlay styles: {exc}")
+
+        def _set_alpha(self, alpha_byte):
+            """Set window opacity via SetLayeredWindowAttributes (LWA_ALPHA only).
+            Does NOT trigger WM_STYLECHANGED (unlike SetWindowLongW)."""
+            if sys.platform.startswith("win") and self._overlay_hwnd:
+                try:
+                    import ctypes
+                    ctypes.windll.user32.SetLayeredWindowAttributes(
+                        self._overlay_hwnd, 0, alpha_byte, 0x2,   # LWA_ALPHA
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.root.attributes("-alpha", alpha_byte / 255)
+                except Exception:
+                    pass
+
+        def _set_transparent(self, on):
+            """on=True → idle (10%). on=False → drag (92%)."""
+            self._set_alpha(25 if on else 235)
 
         def _draw_bar(self, canvas, pct):
             canvas.delete("all")
@@ -1130,60 +1214,78 @@ def run_app():
             wy = self.root.winfo_rooty()
             ww = self.root.winfo_width()
             wh = self.root.winfo_height()
+            self._set_alpha(191 if wx <= mx < wx + ww and wy <= my < wy + wh else 25)
+
+        def _zorder_vs_taskbar(self):
+            """Walk the z-order chain from the top and return our position
+            relative to Shell_TrayWnd: 'above', 'below', or 'unknown'."""
+            if not sys.platform.startswith("win") or not self._topmost_hwnd:
+                return "unknown"
             try:
-                self.root.attributes(
-                    "-alpha", 0.75 if wx <= mx < wx + ww and wy <= my < wy + wh else 0.1
-                )
-            except tk.TclError:
-                pass
+                import ctypes
+                taskbar = _w32_find_window("Shell_TrayWnd")
+                if not taskbar:
+                    return "unknown"
+                GW_HWNDNEXT = 2
+                hwnd = ctypes.windll.user32.GetTopWindow(0)
+                our_seen = False
+                while hwnd:
+                    if hwnd == self._topmost_hwnd:
+                        our_seen = True
+                    elif hwnd == taskbar:
+                        return "above" if our_seen else "below"
+                    hwnd = ctypes.windll.user32.GetWindow(hwnd, GW_HWNDNEXT)
+                return "unknown"
+            except Exception:
+                return "error"
 
         def _reassert_topmost(self):
-            """Re-assert HWND_TOPMOST z-order via SetWindowPos.
+            """Re-promote the widget to the very top of the HWND_TOPMOST z-layer.
 
-            Tkinter's -topmost True sets the flag once at init, but the Windows
-            taskbar is itself HWND_TOPMOST.  When the user clicks the taskbar,
-            Windows re-promotes it to the front of the topmost layer and our
-            widget ends up behind it.
+            Must go through root.attributes("-topmost") rather than raw ctypes
+            SetWindowPos because Tkinter's WndProc intercepts WM_WINDOWPOSCHANGING
+            and silently reverts any topmost promotion that did not originate from
+            Tk's own machinery (it checks its internal wmPtr->flags and cancels
+            external SetWindowPos(HWND_TOPMOST) calls).
 
-            Critical: winfo_id() returns Tk's *inner* drawing-surface HWND (a
-            child window).  SetWindowPos z-order only works on top-level windows.
-            We must call GetAncestor(GA_ROOT=2) to reach the outer wrapper HWND
-            that Tkinter's own -topmost attribute targets internally.  Calling
-            SetWindowPos on the inner HWND silently succeeds but does nothing to
-            z-order, which is why the earlier implementation had no effect.
+            NOTOPMOST first: SetWindowPos(HWND_TOPMOST) on a window already in the
+            topmost group is a z-order no-op — "remains in its original location."
+            Setting NOTOPMOST first re-enters the window as a new TOPMOST entrant,
+            placing it above all other topmost windows including the taskbar.
+            Both steps are synchronous with no message-loop iteration between them
+            so there is no DWM repaint of the briefly-not-topmost state.
             """
             if not sys.platform.startswith("win"):
                 return
             try:
-                import ctypes
-                if self._topmost_hwnd is None:
-                    inner = self.root.winfo_id()
-                    # GA_ROOT=2: walk the parent chain to the true top-level window
-                    wrapper = ctypes.windll.user32.GetAncestor(inner, 2)
-                    self._topmost_hwnd = wrapper or inner
-                    _taskbar_log(
-                        f"topmost HWND resolved: inner=0x{inner:08X}  "
-                        f"wrapper=0x{self._topmost_hwnd:08X}",
-                        ALIGNMENT_CONFIG,
-                    )
-                # HWND_TOPMOST = -1
-                # SWP_NOSIZE=0x0001 | SWP_NOMOVE=0x0002 | SWP_NOACTIVATE=0x0010
-                ctypes.windll.user32.SetWindowPos(
-                    self._topmost_hwnd, -1, 0, 0, 0, 0, 0x0013,
-                )
+                self.root.attributes("-topmost", False)
+                self.root.attributes("-topmost", True)
+                # Log z-order result: first 5 calls always; then once per minute.
+                if not hasattr(self, "_rt_count"):
+                    self._rt_count = 0
+                    self._rt_next_log = 0.0
+                self._rt_count += 1
+                now = time.monotonic()
+                if self._rt_count <= 5 or now >= self._rt_next_log:
+                    self._rt_next_log = now + 60
+                    if self._topmost_hwnd:
+                        import ctypes
+                        exs = ctypes.windll.user32.GetWindowLongW(self._topmost_hwnd, -20)
+                        rect = _w32_get_rect(self._topmost_hwnd)
+                        zord = self._zorder_vs_taskbar()
+                        print(
+                            f"[overlay] reassert #{self._rt_count}: "
+                            f"TOPMOST={bool(exs & 0x8)}  zorder={zord!r}  rect={rect}"
+                        )
             except Exception:
                 pass
 
         def _fast_tick(self):
-            """Runs every 200ms: reasserts topmost z-order and drives hover alpha.
-
-            Reasserting every 200ms means the widget recovers within one blink
-            even if the taskbar temporarily wins the HWND_TOPMOST z-order battle.
-            Hover alpha: 0.75 when mouse is inside the widget, 0.1 when outside.
-            """
+            """Runs every 150ms: drives hover alpha.
+            Topmost z-order is managed by the WinEvent hook (event-driven),
+            not polled here — that was the 'normal always-on-top' approach."""
             if should_quit.is_set():
                 return
-            self._reassert_topmost()
             if widget_visible.is_set() and not self._dragging:
                 try:
                     mx = self.root.winfo_pointerx()
@@ -1193,13 +1295,19 @@ def run_app():
                     ww = self.root.winfo_width()
                     wh = self.root.winfo_height()
                     inside = wx <= mx < wx + ww and wy <= my < wy + wh
-                    self.root.attributes("-alpha", 0.75 if inside else 0.1)
-                except tk.TclError:
+                    self._set_alpha(191 if inside else 25)
+                except Exception:
                     pass
-            self.root.after(200, self._fast_tick)
+            self.root.after(150, self._fast_tick)
 
         def _tick(self):
             if should_quit.is_set():
+                if self._win_event_hook:
+                    try:
+                        import ctypes
+                        ctypes.windll.user32.UnhookWinEvent(self._win_event_hook)
+                    except Exception:
+                        pass
                 self.root.quit()
                 return
             if widget_visible.is_set():
@@ -1207,7 +1315,7 @@ def run_app():
                     self.root.deiconify()
                     self._set_transparent(True)
                 self._render()
-                self._reassert_topmost()
+                self._reassert_topmost()   # 1-second safety net for z-order
                 # Periodically re-align to the tray (handles taskbar moves, DPI changes,
                 # monitor layout changes, and tray overflow expand/collapse).
                 if ALIGNMENT_CONFIG.enabled:

@@ -1033,29 +1033,6 @@ def run_app():
                     0, 0, 0x0000,
                 )
 
-                # Diagnostic: always printed so the user can verify with Spy++
-                exstyle = ctypes.windll.user32.GetWindowLongW(outer, GWL_EXSTYLE)
-                win_rect = _w32_get_rect(outer)
-                tb_info  = find_taskbar_tray_rect()
-                dpi = 96
-                try:
-                    dpi = ctypes.windll.user32.GetDpiForWindow(outer)
-                except Exception:
-                    pass
-                print(f"[overlay] inner=0x{inner:08X}  outer(HWND)=0x{outer:08X}")
-                print(
-                    f"[overlay] exstyle=0x{exstyle:08X}"
-                    f"  WS_EX_LAYERED={bool(exstyle & 0x80000)}"
-                    f"  WS_EX_TOPMOST={bool(exstyle & 0x8)}"
-                    f"  WS_EX_TOOLWINDOW={bool(exstyle & 0x80)}"
-                )
-                print(f"[overlay] window_rect={win_rect}  dpi={dpi}")
-                if tb_info:
-                    print(f"[overlay] taskbar_rect={tb_info['taskbar_rect']}")
-                    print(f"[overlay] tray_rect={tb_info['tray_rect']}")
-                # Log z-order at init (note: window not yet shown, so this is
-                # the pre-mainloop snapshot — after(0) will reassert and log again)
-                print(f"[overlay] init zorder vs taskbar: {self._zorder_vs_taskbar()}")
             except Exception as exc:
                 print(f"[overlay] WARNING: failed to apply overlay styles: {exc}")
 
@@ -1278,23 +1255,6 @@ def run_app():
             try:
                 self.root.attributes("-topmost", False)
                 self.root.attributes("-topmost", True)
-                # Log z-order result: first 5 calls always; then once per minute.
-                if not hasattr(self, "_rt_count"):
-                    self._rt_count = 0
-                    self._rt_next_log = 0.0
-                self._rt_count += 1
-                now = time.monotonic()
-                if self._rt_count <= 5 or now >= self._rt_next_log:
-                    self._rt_next_log = now + 60
-                    if self._topmost_hwnd:
-                        import ctypes
-                        exs = ctypes.windll.user32.GetWindowLongW(self._topmost_hwnd, -20)
-                        rect = _w32_get_rect(self._topmost_hwnd)
-                        zord = self._zorder_vs_taskbar()
-                        print(
-                            f"[overlay] reassert #{self._rt_count}: "
-                            f"TOPMOST={bool(exs & 0x8)}  zorder={zord!r}  rect={rect}"
-                        )
             except Exception:
                 pass
 

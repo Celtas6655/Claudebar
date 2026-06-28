@@ -412,6 +412,27 @@ def _w32_find_window(cls, title=None):
         return 0
 
 
+def _zorder_position(hwnd_chain, our_hwnd, taskbar_hwnd):
+    """Pure z-order check: is our_hwnd above or below taskbar_hwnd?
+
+    hwnd_chain is an iterable of HWNDs ordered top→bottom (as returned by
+    walking GetTopWindow → GetWindow(GW_HWNDNEXT)).
+
+    Returns 'above' if our_hwnd appears before taskbar_hwnd in the chain,
+    'below' if it appears after, or 'unknown' if either HWND is absent.
+
+    Kept at module level (not inside FloatingWidget) so it can be unit-tested
+    without a GUI or Win32 dependency.
+    """
+    our_seen = False
+    for hwnd in hwnd_chain:
+        if hwnd == our_hwnd:
+            our_seen = True
+        elif hwnd == taskbar_hwnd:
+            return "above" if our_seen else "below"
+    return "unknown"
+
+
 def diagnose_taskbar_windows(config=None):
     """Walk the Shell_TrayWnd child tree and log every window's class/text/rect.
 
@@ -1227,15 +1248,12 @@ def run_app():
                 if not taskbar:
                     return "unknown"
                 GW_HWNDNEXT = 2
+                chain = []
                 hwnd = ctypes.windll.user32.GetTopWindow(0)
-                our_seen = False
                 while hwnd:
-                    if hwnd == self._topmost_hwnd:
-                        our_seen = True
-                    elif hwnd == taskbar:
-                        return "above" if our_seen else "below"
+                    chain.append(hwnd)
                     hwnd = ctypes.windll.user32.GetWindow(hwnd, GW_HWNDNEXT)
-                return "unknown"
+                return _zorder_position(chain, self._topmost_hwnd, taskbar)
             except Exception:
                 return "error"
 
@@ -1761,6 +1779,104 @@ def run_tests():
         if not sys.platform.startswith("win"):
             assert find_tray_notification_rect() is None
             print("find_tray_notification_rect() correctly returns None off-Windows: OK")
+
+        # --- z-order position algorithm ---
+        # _zorder_position walks a top→bottom HWND chain and reports our position
+        # relative to the taskbar.  Tests use fake integer HWNDs.
+        OUR, TB, OTHER1, OTHER2 = 100, 200, 300, 400
+
+        assert _zorder_position([OUR, OTHER1, TB], OUR, TB) == "above"
+        assert _zorder_position([OTHER1, TB, OUR], OUR, TB) == "below"
+        assert _zorder_position([OTHER1, OUR, TB, OTHER2], OUR, TB) == "above"
+        # taskbar found but our HWND never appeared before it → we are below
+        assert _zorder_position([OTHER1, OTHER2, TB], OUR, TB) == "below"
+        # taskbar absent from chain entirely → cannot determine position
+        assert _zorder_position([OUR, OTHER1, OTHER2], OUR, TB) == "unknown"
+        assert _zorder_position([], OUR, TB) == "unknown"                     # empty chain
+        assert _zorder_position([TB, OUR], OUR, TB) == "below"                # taskbar first
+        assert _zorder_position([OUR, TB], OUR, TB) == "above"                # adjacent
+        print("z-order position algorithm: OK")
+
+        # --- overlay machinery regression guards ---
+        # Each test here encodes a specific bug that was introduced during development
+        # and cost significant debugging time.  If the fix is ever accidentally reverted,
+        # the test name and message say exactly what broke and why.
+        import re
+
+        with open(__file__, encoding="utf-8") as _f:
+            _src = _f.read()
+
+        def _method_body(name):
+            """Extract the body of a method named `name` from the source, stripping docstrings."""
+            m = re.search(
+                rf"def {re.escape(name)}\(self\):(.*?)(?=\n        def |\Z)",
+                _src, re.DOTALL,
+            )
+            assert m, f"{name} not found in source"
+            return re.sub(r'""".*?"""', "", m.group(1), flags=re.DOTALL)
+
+        # Guard 1: _reassert_topmost must use root.attributes(), not ctypes SetWindowPos.
+        #
+        # Background: Tk's WndProc intercepts WM_WINDOWPOSCHANGING and silently reverts
+        # any HWND_TOPMOST promotion that did not originate from Tk's own machinery
+        # (it checks wmPtr->flags and cancels external SetWindowPos(-1) calls).
+        # Using root.attributes("-topmost") goes through Tk's own path, so it sticks.
+        _rt = _method_body("_reassert_topmost")
+        assert 'attributes("-topmost", False)' in _rt, \
+            "REGRESSION: _reassert_topmost must call root.attributes('-topmost', False) first"
+        assert 'attributes("-topmost", True)' in _rt, \
+            "REGRESSION: _reassert_topmost must call root.attributes('-topmost', True)"
+        assert _rt.index('attributes("-topmost", False)') < _rt.index('attributes("-topmost", True)'), \
+            "REGRESSION: _reassert_topmost must set False (NOTOPMOST) before True (TOPMOST); " \
+            "SetWindowPos(HWND_TOPMOST) on an already-topmost window is a z-order no-op"
+        assert "windll.user32.SetWindowPos" not in _rt, \
+            "REGRESSION: _reassert_topmost must not call ctypes.SetWindowPos directly — " \
+            "Tk's WndProc vetoes it, leaving TOPMOST=False every time"
+        print("_reassert_topmost uses root.attributes (not ctypes SetWindowPos): OK")
+
+        # Guard 2: _apply_overlay_styles must NOT call root.attributes("-topmost") synchronously.
+        #
+        # Background: calling root.attributes("-topmost", True) inside _apply_overlay_styles()
+        # triggers Tk's SetWindowPos internally while the geometry from _place_initial() is
+        # still queued.  The synchronous Win32 message processing during that SetWindowPos
+        # cancels the pending window move, leaving the widget stuck at (0, 0) permanently.
+        _ao = _method_body("_apply_overlay_styles")
+        # Strip comment-only lines before scanning for attribute calls (comments
+        # in the method body may legitimately mention the attribute by name)
+        _ao_code = "\n".join(
+            ln for ln in _ao.splitlines() if not ln.lstrip().startswith("#")
+        )
+        direct_topmost = [c for c in re.findall(r'.{0,60}attributes\("-topmost"', _ao_code)
+                          if "after(" not in c]
+        assert not direct_topmost, \
+            "REGRESSION: _apply_overlay_styles must not call root.attributes('-topmost') " \
+            "synchronously — it cancels the pending geometry from _place_initial(), " \
+            f"locking the widget at (0,0). Found: {direct_topmost}"
+        print("_apply_overlay_styles has no synchronous root.attributes(-topmost) call: OK")
+
+        # Guard 3: FloatingWidget.__init__ must flush geometry to Win32 between
+        # _place_initial() and _apply_overlay_styles().
+        #
+        # Background: root.geometry() queues the window move but does not immediately
+        # call SetWindowPos.  Without update_idletasks() to flush the queue first,
+        # the Win32 message processing inside _apply_overlay_styles() (specifically
+        # SetWindowLongW posting WM_STYLECHANGED) cancels the queued move.
+        # Result: the widget is positioned correctly in Tk's internal state but sits
+        # at (0, 0) in Win32 / GetWindowRect — permanently.
+        #
+        # We scan the source text directly between the two call sites rather than
+        # trying to extract __init__'s body via regex (the file has multiple nested
+        # __init__ definitions at the same indentation level which confuse the extractor).
+        _pi_src = _src.find("self._place_initial()")
+        _ao_src = _src.find("self._apply_overlay_styles()")
+        assert 0 < _pi_src < _ao_src, \
+            "_place_initial() must appear before _apply_overlay_styles() in source"
+        _between_calls = _src[_pi_src:_ao_src]
+        assert "update_idletasks()" in _between_calls, \
+            "REGRESSION: __init__ must call update_idletasks() between _place_initial() " \
+            "and _apply_overlay_styles() — without it, the pending geometry move is " \
+            "cancelled by Win32 message processing during style setup, leaving widget at (0,0)"
+        print("__init__ flushes geometry before _apply_overlay_styles: OK")
 
         print("\nALL TESTS PASSED")
     finally:

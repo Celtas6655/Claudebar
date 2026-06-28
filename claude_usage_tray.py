@@ -882,6 +882,9 @@ def run_app():
 
         BAR_W, BAR_H = 90, 10
         BG, FG, DIM, TRACK = "#1e1e1e", "#e6e6e6", "#888888", "#3a3a3a"
+        # COLORREF (0x00BBGGRR) for BG="#1e1e1e"; used as colorkey so the
+        # background is punched through in idle mode (data-only, no dark panel).
+        _BG_COLORREF = 0x001E1E1E
 
         def __init__(self):
             self.root = tk.Tk()
@@ -999,9 +1002,8 @@ def run_app():
                     cur | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 )
 
-                # Global alpha transparency.  alpha=1 here is a placeholder —
-                # _set_transparent(True) is called immediately after this method
-                # and sets the real idle opacity (25 ≈ 10%).
+                # Placeholder: alpha=1, no colorkey.  _set_transparent(True) is
+                # called immediately after and switches to colorkey+255 (idle mode).
                 ctypes.windll.user32.SetLayeredWindowAttributes(
                     outer, 0, 1, LWA_ALPHA,
                 )
@@ -1036,26 +1038,39 @@ def run_app():
             except Exception as exc:
                 print(f"[overlay] WARNING: failed to apply overlay styles: {exc}")
 
-        def _set_alpha(self, alpha_byte):
-            """Set window opacity via SetLayeredWindowAttributes (LWA_ALPHA only).
+        def _set_alpha(self, alpha_byte, *, colorkey=False):
+            """Set window opacity via SetLayeredWindowAttributes.
+            colorkey=True → also punch through the BG colour so only the data
+            (text, bars) is visible; the dark panel background disappears.
             Does NOT trigger WM_STYLECHANGED (unlike SetWindowLongW)."""
             if sys.platform.startswith("win") and self._overlay_hwnd:
                 try:
                     import ctypes
-                    ctypes.windll.user32.SetLayeredWindowAttributes(
-                        self._overlay_hwnd, 0, alpha_byte, 0x2,   # LWA_ALPHA
-                    )
+                    if colorkey:
+                        ctypes.windll.user32.SetLayeredWindowAttributes(
+                            self._overlay_hwnd, self._BG_COLORREF, alpha_byte,
+                            0x3,   # LWA_COLORKEY | LWA_ALPHA
+                        )
+                    else:
+                        ctypes.windll.user32.SetLayeredWindowAttributes(
+                            self._overlay_hwnd, 0, alpha_byte, 0x2,   # LWA_ALPHA only
+                        )
                 except Exception:
                     pass
             else:
+                # Non-Windows: no colorkey support; best effort is full visibility.
                 try:
-                    self.root.attributes("-alpha", alpha_byte / 255)
+                    self.root.attributes("-alpha", 1.0 if colorkey else alpha_byte / 255)
                 except Exception:
                     pass
 
         def _set_transparent(self, on):
-            """on=True → idle (10%). on=False → drag (92%)."""
-            self._set_alpha(25 if on else 235)
+            """on=True → idle: data fully visible, background punched through.
+            on=False → drag: background panel visible at 92%."""
+            if on:
+                self._set_alpha(255, colorkey=True)
+            else:
+                self._set_alpha(235)
 
         def _draw_bar(self, canvas, pct):
             canvas.delete("all")
@@ -1212,7 +1227,10 @@ def run_app():
             wy = self.root.winfo_rooty()
             ww = self.root.winfo_width()
             wh = self.root.winfo_height()
-            self._set_alpha(191 if wx <= mx < wx + ww and wy <= my < wy + wh else 25)
+            if wx <= mx < wx + ww and wy <= my < wy + wh:
+                self._set_alpha(191)
+            else:
+                self._set_alpha(255, colorkey=True)
 
         def _zorder_vs_taskbar(self):
             """Walk the z-order chain from the top and return our position
@@ -1273,7 +1291,10 @@ def run_app():
                     ww = self.root.winfo_width()
                     wh = self.root.winfo_height()
                     inside = wx <= mx < wx + ww and wy <= my < wy + wh
-                    self._set_alpha(191 if inside else 25)
+                    if inside:
+                        self._set_alpha(191)
+                    else:
+                        self._set_alpha(255, colorkey=True)
                 except Exception:
                     pass
             self.root.after(150, self._fast_tick)

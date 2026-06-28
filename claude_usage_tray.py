@@ -913,10 +913,6 @@ def run_app():
                 metrics_row, width=self.BAR_W, height=self.BAR_H, bg=self.BG, highlightthickness=0,
             )
             self.session_canvas.pack(side="left", padx=(0, 4))
-            self.session_pct_lbl = tk.Label(
-                metrics_row, font=("Consolas", _fs, "bold"), bg=self.BG, width=4, anchor="e",
-            )
-            self.session_pct_lbl.pack(side="left")
             self.session_reset_lbl = tk.Label(
                 metrics_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG, anchor="w",
             )
@@ -931,10 +927,6 @@ def run_app():
                 metrics_row, width=self.BAR_W, height=self.BAR_H, bg=self.BG, highlightthickness=0,
             )
             self.weekly_canvas.pack(side="left", padx=(0, 4))
-            self.weekly_pct_lbl = tk.Label(
-                metrics_row, font=("Consolas", _fs, "bold"), bg=self.BG, width=4, anchor="e",
-            )
-            self.weekly_pct_lbl.pack(side="left")
             self.weekly_reset_lbl = tk.Label(
                 metrics_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG, anchor="w",
             )
@@ -991,14 +983,20 @@ def run_app():
                 canvas.create_rectangle(
                     0, 0, fill_w, self.BAR_H, fill=WIDGET_COLORS[pct_tag(pct)], outline="",
                 )
+                label, text_color = f"{pct:.0f}%", "#ffffff"
+            else:
+                label, text_color = "--", self.DIM
+            canvas.create_text(
+                self.BAR_W // 2, self.BAR_H // 2,
+                text=label, fill=text_color,
+                font=("Consolas", self._fs, "bold"), anchor="center",
+            )
 
-        def _render_metric_row(self, canvas, pct_lbl, reset_lbl, pct, resets_at):
+        def _render_metric_row(self, canvas, reset_lbl, pct, resets_at):
             self._draw_bar(canvas, pct)
             if pct is not None:
-                pct_lbl.config(text=f"{pct:.0f}%", fg=WIDGET_COLORS[pct_tag(pct)])
                 reset_lbl.config(text=fmt_reset_clock(resets_at) or "?", fg=self.DIM)
             else:
-                pct_lbl.config(text="--", fg=self.DIM)
                 reset_lbl.config(text="--", fg=self.DIM)
 
         def _render(self):
@@ -1009,11 +1007,11 @@ def run_app():
             )
             cache = read_usage_cache() or {}
             self._render_metric_row(
-                self.session_canvas, self.session_pct_lbl, self.session_reset_lbl,
+                self.session_canvas, self.session_reset_lbl,
                 cache.get("session_used_percentage"), cache.get("session_resets_at"),
             )
             self._render_metric_row(
-                self.weekly_canvas, self.weekly_pct_lbl, self.weekly_reset_lbl,
+                self.weekly_canvas, self.weekly_reset_lbl,
                 cache.get("weekly_used_percentage"), cache.get("weekly_resets_at"),
             )
 

@@ -850,6 +850,7 @@ def run_app():
     WATCHER_RETRY_SECONDS = 5     # retry interval if projects dir doesn't exist yet
     WIDGET_POS_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_pos.json")
     ALIGNMENT_CONFIG_PATH = os.path.join(CLAUDE_HOME, "usage_tray_alignment.json")
+    WIDGET_PIN_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_pin.json")
 
     ALIGNMENT_CONFIG = TaskbarAlignmentConfig()
     _saved_align = read_usage_cache(cache_path=ALIGNMENT_CONFIG_PATH) or {}
@@ -863,6 +864,10 @@ def run_app():
     widget_visible = threading.Event()
     widget_visible.set()  # shown by default
     should_quit = threading.Event()
+    position_pinned = threading.Event()
+    _saved_pin = read_usage_cache(cache_path=WIDGET_PIN_PATH) or {}
+    if _saved_pin.get("pinned", False):
+        position_pinned.set()
 
     def current_snapshot():
         with state_lock:
@@ -1198,6 +1203,8 @@ def run_app():
             return sw - w - 220, sh - h - 50
 
         def _start_drag(self, event):
+            if position_pinned.is_set():
+                return
             self._drag_offset = (
                 event.x_root - self.root.winfo_x(),
                 event.y_root - self.root.winfo_y(),
@@ -1206,6 +1213,8 @@ def run_app():
             self._set_transparent(False)
 
         def _do_drag(self, event):
+            if position_pinned.is_set():
+                return
             x = event.x_root - self._drag_offset[0]
             y = event.y_root - self._drag_offset[1]
             self.root.geometry(f"+{x}+{y}")
@@ -1425,6 +1434,11 @@ def run_app():
             on_toggle_alignment,
             checked=lambda item: ALIGNMENT_CONFIG.enabled,
         ))
+        items.append(pystray.MenuItem(
+            "Pin position",
+            on_toggle_pin,
+            checked=lambda item: position_pinned.is_set(),
+        ))
         items.append(pystray.MenuItem("Refresh now", on_refresh))
         items.append(pystray.MenuItem("Open logs folder", on_open_folder))
         items.append(pystray.MenuItem("Quit", on_quit))
@@ -1451,6 +1465,14 @@ def run_app():
     def on_toggle_alignment(icon, item):
         ALIGNMENT_CONFIG.enabled = not ALIGNMENT_CONFIG.enabled
         write_usage_cache({"enabled": ALIGNMENT_CONFIG.enabled}, cache_path=ALIGNMENT_CONFIG_PATH)
+
+    def on_toggle_pin(icon, item):
+        if position_pinned.is_set():
+            position_pinned.clear()
+            write_usage_cache({"pinned": False}, cache_path=WIDGET_PIN_PATH)
+        else:
+            position_pinned.set()
+            write_usage_cache({"pinned": True}, cache_path=WIDGET_PIN_PATH)
 
     def on_quit(icon, item):
         should_quit.set()

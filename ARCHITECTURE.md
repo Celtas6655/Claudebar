@@ -161,7 +161,7 @@ accident of how it was first written.
 | `Pillow` | Static `.ico` asset | Tray icon is generated programmatically (a simple drawn circle) so there's no binary asset to ship/track in the repo |
 | `watchdog` | Polling on a timer | Real-time was an explicit, later request ("is this real-time?") — OS-level filesystem-change notifications (`ReadDirectoryChangesW` on Windows under the hood) react in single-digit milliseconds vs. up to N seconds of polling lag |
 | `tkinter` (stdlib) | A second Electron/web view, a native win32 window | Ships with the standard python.org Windows installer by default, zero extra dependency, sufficient for a small HUD |
-| `pywin32` (optional) | Skipping precise placement entirely | Only way to ask Windows directly where the real taskbar notification area is on screen; wrapped so its absence degrades gracefully, not a hard dependency |
+| `ctypes` (stdlib) taskbar lookup | `pywin32`, or skipping precise placement entirely | Asks Windows directly (via `user32` calls through `ctypes`) where the real taskbar notification area is on screen. Originally used `pywin32`; moved to `ctypes` so there's zero extra dependency to install. Wrapped so any failure degrades gracefully, never a hard requirement. |
 
 ## 5. Threading & concurrency model — read this before touching `run_app()`
 
@@ -315,23 +315,49 @@ change, recreate this harness as a throwaway script; don't merge it into
 ### Initial widget placement: best-effort taskbar detection
 
 On first run (no saved drag position yet), `_default_position()` tries
-`find_tray_notification_rect()`, which calls into `pywin32`
-(`win32gui.FindWindow("Shell_TrayWnd", None)` →
-`FindWindowEx(taskbar, 0, "TrayNotifyWnd", None)` →
-`GetWindowRect(...)`) to find the real screen coordinates of the
-notification area where tray icons live, and positions the widget just
-to its left, vertically centered on the taskbar's height. This is
+`find_tray_notification_rect()` (a thin wrapper over
+`find_taskbar_tray_rect()`), which calls the Win32 API directly through
+`ctypes` (`user32.FindWindowW("Shell_TrayWnd", None)` → walk its child
+tree for `TrayNotifyWnd` → `GetWindowRect(...)`) to find the real screen
+coordinates of the notification area where tray icons live, and
+positions the widget just to its left, vertically centered on the
+taskbar's height. `ctypes` is stdlib, so there's nothing to install —
+the earlier `pywin32` dependency was dropped. This is
 **explicitly unverified on real Windows hardware** — the dev sandbox has
 no Windows taskbar to query. It's wrapped defensively (`sys.platform`
-check, `try/except ImportError`, broad `except Exception` around the
-actual win32 calls) so any failure — wrong window classes on some
-Windows version, `pywin32` not installed, the taskbar being on a
-secondary monitor, etc. — falls back to a screen-corner heuristic
+check, broad `except Exception` around every `ctypes` call, and a
+reserved-width fallback when no tray child window can be located) so any
+failure — wrong window classes on some Windows version, the taskbar
+being on a secondary monitor, etc. — falls back to a screen-corner
+heuristic
 (`sw - w - 220, sh - h - 50`) rather than crashing. Because the user's
 own drag position is saved and preferred from then on, this heuristic
 only matters for the very first launch ever — low stakes, but worth
 flagging clearly as "designed, not field-verified" if you're asked about
 it.
+
+### Favorite widget position (single slot)
+
+A fourth small JSON sidecar, `usage_tray_widget_favorite_pos.json`
+(`WIDGET_FAVORITE_POS_PATH`), holds one user-designated "return to this
+spot" position — independent of `usage_tray_widget_pos.json`, which always
+tracks wherever the widget last ended up (drag, alignment, or a favorite
+load). It's a single slot by deliberate choice, not a named list, per an
+explicit product decision — this was raised and decided directly with the
+project owner rather than assumed.
+
+Two tray menu items back it: "Save current position as favorite" reads
+`FloatingWidget.last_known_pos` (a plain tuple mirrored from the Tk thread
+into a shared attribute after every reposition — `__init__`, `_end_drag()`,
+`_tick()`) rather than calling any Tkinter getter from the tray thread.
+"Load favorite position" sets `load_favorite_requested` (a
+`threading.Event`), which `FloatingWidget._tick()` polls and applies via
+`_apply_favorite_position()` — the newest instance of the
+flag-set-elsewhere/polled-in-`_tick()` pattern already described in §5, not
+a new mechanism. Loading a favorite also disables `ALIGNMENT_CONFIG.enabled`
+and overwrites `usage_tray_widget_pos.json`, mirroring exactly what
+`_end_drag()` already does, so a restart keeps the loaded favorite as the
+new baseline instead of reverting to wherever the widget was before the load.
 
 ## 7. Testing philosophy
 
@@ -379,7 +405,9 @@ Everything this app reads or writes, and why:
 | `~/.claude/projects/**/*.jsonl` | Claude Code itself (not us) | `UsageTracker` | Token usage, cost, model/project breakdown. Read-only to us. |
 | `~/.claude/usage_tray_cache.json` | `--statusline-hook` mode | tray menu, floating widget | Session (5h) %, weekly (7d) %, context-window %, reset timestamps. Atomic write (temp file + `os.replace`). |
 | `~/.claude/usage_tray_widget_pos.json` | `FloatingWidget._end_drag()` | `FloatingWidget._default_position()` | Remembers where the user dragged the widget, so the taskbar-detection heuristic only applies once, ever. |
+| `~/.claude/usage_tray_widget_favorite_pos.json` | tray menu's "Save current position as favorite" (`on_save_favorite`, via `widget.last_known_pos`) | `FloatingWidget._apply_favorite_position()`; "Load favorite position" menu item's `enabled=` check | User-designated single favorite screen position, independent of the last-dragged position (`usage_tray_widget_pos.json`). Same atomic-write shape. |
 | `~/.claude/settings.json` | the user, manually | Claude Code itself | Where `statusLine.command` is wired to point at `python ... --statusline-hook`. Not managed by this app — just documented. |
+| `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`ClaudeUsageTray` value) | tray menu's "Run on Windows startup" toggle (`on_toggle_startup` → `set_startup_enabled`) | Windows itself, at login | Per-user autostart registration. Not a file, but the same "external state this app manages" category — added/removed via `winreg`, no admin rights needed (HKCU, not HKLM). |
 
 ## 9. Known limitations and things explicitly not verified
 
@@ -422,6 +450,17 @@ advance:
   of a new/cleared session** — populates after the first completed
   response, not before. Don't mistake this for a bug during support
   conversations.
+- **The "Run on Windows startup" registry toggle's read/write/delete
+  logic is unit-tested against a disposable registry subkey (never the
+  real `...\CurrentVersion\Run`), and confirmed to actually round-trip on
+  real Windows via `--test`** — but the end-to-end behavior (does the app
+  really appear in the tray after a full logout/login cycle) has not been
+  manually confirmed. If someone reports the app not launching at login
+  after enabling the toggle, check Task Manager's Startup tab and
+  `regedit` for the `ClaudeUsageTray` value first. Also note: if the
+  `.exe`/script is moved, renamed, or rebuilt to a new path after the
+  toggle was enabled, the registry entry still points at the old
+  location — this isn't auto-repaired, by design (see README).
 
 ## 10. Operational gotchas discovered during real setup (worth keeping as institutional memory)
 

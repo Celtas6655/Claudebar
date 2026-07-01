@@ -43,6 +43,7 @@ safety net.
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -294,29 +295,529 @@ def pct_tag(pct):
     return "red"
 
 
-def find_tray_notification_rect():
-    """Best-effort lookup of Windows' taskbar notification area (where the
-    tray icons live), in screen pixels: {'left', 'top', 'height'}.
-    Returns None on non-Windows platforms, if pywin32 isn't installed, or
-    if the lookup fails for any reason -- callers must have a fallback."""
+# --------------------------------------------------------------------------
+# Taskbar alignment: configuration, diagnostics, and tray-rect detection.
+#
+# All coordinate-returning functions produce Win32 physical pixels.  On
+# modern Python 3.x + Windows 10/11 (per-monitor DPI aware), Tkinter's
+# geometry() also takes physical pixels, so no unit conversion is needed
+# between Win32 rect values and Tk geometry strings.
+#
+# Uses ctypes (stdlib) only -- pywin32 is no longer required.
+# --------------------------------------------------------------------------
+
+class TaskbarAlignmentConfig:
+    """Controls how the floating widget is anchored next to the system tray.
+
+    Attributes
+    ----------
+    enabled : bool
+        When True the widget is positioned (and periodically re-positioned)
+        left of the tray rather than at the last-dragged location.
+        Dragging the widget disables this mode automatically.
+    gap_px : int
+        Clear space between the widget's right edge and the tray's left edge.
+    vertical_mode : str
+        "inside-taskbar" — widget is vertically centred on the taskbar.
+        "above-taskbar" — widget floats above the taskbar top edge.
+    vertical_offset_px : int
+        Additional vertical nudge (positive = downward).
+    overlap_px : int
+        For "above-taskbar" mode: pixels of overlap with the taskbar top.
+    fallback_reserved_tray_width_px : int
+        When no tray child window can be located, treat this many pixels at
+        the taskbar's right end as the tray area (logged loudly when used).
+    debug_logging : bool
+        Print a full diagnostic tree on startup and log all alignment
+        decisions.  Enable via the TRAY_DEBUG=1 environment variable.
+    """
+
+    def __init__(self):
+        self.enabled = True
+        self.gap_px = 8
+        self.vertical_mode = "inside-taskbar"
+        self.vertical_offset_px = 0
+        self.overlap_px = 0
+        self.fallback_reserved_tray_width_px = 300
+        self.debug_logging = os.environ.get("TRAY_DEBUG") == "1"
+
+
+def _taskbar_log(msg, config=None):
+    """Print msg if config.debug_logging is True (or config is None)."""
+    if config is None or config.debug_logging:
+        print(f"[taskbar] {msg}", flush=True)
+
+
+def _w32_class_name(hwnd):
+    """GetClassNameW → string.  Returns '' on failure."""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def _w32_window_text(hwnd):
+    """GetWindowTextW → string.  Returns '' on failure."""
+    try:
+        import ctypes
+        n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        if n == 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(n + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, n + 1)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def _w32_get_rect(hwnd):
+    """GetWindowRect → (left, top, right, bottom) in physical pixels, or None."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        r = ctypes.wintypes.RECT()
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+        return (r.left, r.top, r.right, r.bottom)
+    except Exception:
+        return None
+
+
+def _w32_enum_children(parent_hwnd):
+    """EnumChildWindows → list of all child HWNDs (recursive), or []."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        children = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM,
+        )
+        def _cb(hwnd, _lparam):
+            children.append(hwnd)
+            return True
+        cb = WNDENUMPROC(_cb)
+        ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
+        return children
+    except Exception:
+        return []
+
+
+def _w32_find_window(cls, title=None):
+    """FindWindowW → HWND (int) or 0."""
+    try:
+        import ctypes
+        return ctypes.windll.user32.FindWindowW(cls, title) or 0
+    except Exception:
+        return 0
+
+
+def _zorder_position(hwnd_chain, our_hwnd, taskbar_hwnd):
+    """Pure z-order check: is our_hwnd above or below taskbar_hwnd?
+
+    hwnd_chain is an iterable of HWNDs ordered top→bottom (as returned by
+    walking GetTopWindow → GetWindow(GW_HWNDNEXT)).
+
+    Returns 'above' if our_hwnd appears before taskbar_hwnd in the chain,
+    'below' if it appears after, or 'unknown' if either HWND is absent.
+
+    Kept at module level (not inside FloatingWidget) so it can be unit-tested
+    without a GUI or Win32 dependency.
+    """
+    our_seen = False
+    for hwnd in hwnd_chain:
+        if hwnd == our_hwnd:
+            our_seen = True
+        elif hwnd == taskbar_hwnd:
+            return "above" if our_seen else "below"
+    return "unknown"
+
+
+def diagnose_taskbar_windows(config=None):
+    """Walk the Shell_TrayWnd child tree and log every window's class/text/rect.
+
+    Returns a list of dicts (hwnd, class, text, rect, width, height) for every
+    window in the tree.  Always safe to call; returns [] on non-Windows.
+    Logging output is suppressed unless config.debug_logging is True.
+
+    Classes looked for specifically:
+      TrayNotifyWnd, SysPager, ToolbarWindow32, ReBarWindow32,
+      MSTaskSwWClass, Shell_SecondaryTrayWnd, ClockButton,
+      TrayShowDesktopButtonWClass
+    """
+    result = []
+    if not sys.platform.startswith("win"):
+        return result
+
+    taskbar_hwnd = _w32_find_window("Shell_TrayWnd")
+    if not taskbar_hwnd:
+        _taskbar_log("diagnose: Shell_TrayWnd not found", config)
+        return result
+
+    rect = _w32_get_rect(taskbar_hwnd)
+    result.append({
+        "hwnd": taskbar_hwnd, "class": "Shell_TrayWnd",
+        "text": _w32_window_text(taskbar_hwnd), "rect": rect,
+        "width": (rect[2] - rect[0]) if rect else None,
+        "height": (rect[3] - rect[1]) if rect else None,
+    })
+    _taskbar_log(f"Shell_TrayWnd hwnd=0x{taskbar_hwnd:08X}  rect={rect}", config)
+
+    children = _w32_enum_children(taskbar_hwnd)
+    _taskbar_log(f"  {len(children)} child window(s) under Shell_TrayWnd:", config)
+
+    INTERESTING = {
+        "TrayNotifyWnd", "SysPager", "ToolbarWindow32", "ReBarWindow32",
+        "MSTaskSwWClass", "Shell_SecondaryTrayWnd", "ClockButton",
+        "TrayShowDesktopButtonWClass",
+    }
+    for child in children:
+        cls = _w32_class_name(child)
+        text = _w32_window_text(child)
+        r = _w32_get_rect(child)
+        result.append({
+            "hwnd": child, "class": cls, "text": text, "rect": r,
+            "width": (r[2] - r[0]) if r else None,
+            "height": (r[3] - r[1]) if r else None,
+        })
+        if cls in INTERESTING:
+            _taskbar_log(
+                f"  0x{child:08X}  {cls:<32}  {text!r:<14}  rect={r}", config,
+            )
+    return result
+
+
+def find_taskbar_tray_rect(config=None):
+    """Locate the system tray notification area in Win32 physical pixels.
+
+    Strategy (each step falls through to the next on failure):
+      Taskbar rect:
+        1. SHAppBarMessage(ABM_GETTASKBARPOS) — authoritative.
+        2. GetWindowRect(Shell_TrayWnd) — fallback.
+      Tray rect (the notification / icon area at the right end):
+        3. TrayNotifyWnd child of Shell_TrayWnd.
+        4. SysPager child (Windows 10 sometimes restructures the tree).
+        5. Rightmost plausible child whose rect overlaps the taskbar.
+        6. taskbar.right − fallback_reserved_tray_width_px (logged loudly).
+
+    Returns a dict on success:
+        {
+          "taskbar_rect":  (l, t, r, b),   # whole taskbar, physical px
+          "tray_rect":     (l, t, r, b),   # notification area, physical px
+          "monitor_rect":  (l, t, r, b) | None,
+          "work_area":     (l, t, r, b) | None,
+          "tray_hwnd":     int,             # 0 when fallback was used
+          "tray_class":    str,
+          "fallback_used": bool,
+          "dpi":           int,
+          "source":        "SHAppBarMessage" | "FindWindow",
+        }
+    Returns None if Shell_TrayWnd can't be found at all.
+    """
     if not sys.platform.startswith("win"):
         return None
     try:
-        import win32gui
+        import ctypes
+        import ctypes.wintypes
     except ImportError:
         return None
-    try:
-        taskbar = win32gui.FindWindow("Shell_TrayWnd", None)
-        if not taskbar:
-            return None
-        notify = win32gui.FindWindowEx(taskbar, 0, "TrayNotifyWnd", None)
-        if not notify:
-            return None
-        left, _top, _right, _bottom = win32gui.GetWindowRect(notify)
-        _t_left, t_top, _t_right, t_bottom = win32gui.GetWindowRect(taskbar)
-        return {"left": left, "top": t_top, "height": t_bottom - t_top}
-    except Exception:
+
+    # 1. Taskbar HWND
+    taskbar_hwnd = _w32_find_window("Shell_TrayWnd")
+    if not taskbar_hwnd:
+        _taskbar_log("Shell_TrayWnd not found", config)
         return None
+    _taskbar_log(f"Shell_TrayWnd hwnd=0x{taskbar_hwnd:08X}", config)
+
+    # 2. Taskbar rect — prefer SHAppBarMessage
+    taskbar_rect = None
+    source = "FindWindow"
+    try:
+        class _ABD(ctypes.Structure):
+            _fields_ = [
+                ("cbSize",           ctypes.wintypes.DWORD),
+                ("hWnd",             ctypes.wintypes.HWND),
+                ("uCallbackMessage", ctypes.wintypes.UINT),
+                ("uEdge",            ctypes.wintypes.UINT),
+                ("rc",               ctypes.wintypes.RECT),
+                ("lParam",           ctypes.wintypes.LPARAM),
+            ]
+        abd = _ABD()
+        abd.cbSize = ctypes.sizeof(_ABD)
+        abd.hWnd = taskbar_hwnd
+        if ctypes.windll.shell32.SHAppBarMessage(0x00000005, ctypes.byref(abd)):
+            r = abd.rc
+            taskbar_rect = (r.left, r.top, r.right, r.bottom)
+            source = "SHAppBarMessage"
+            _taskbar_log(f"Taskbar rect via SHAppBarMessage: {taskbar_rect}", config)
+    except Exception as exc:
+        _taskbar_log(f"SHAppBarMessage failed ({exc}), using GetWindowRect", config)
+
+    if not taskbar_rect:
+        taskbar_rect = _w32_get_rect(taskbar_hwnd)
+        _taskbar_log(f"Taskbar rect via GetWindowRect: {taskbar_rect}", config)
+    if not taskbar_rect:
+        return None
+
+    # 3. DPI for the taskbar window
+    dpi = 96
+    try:
+        dpi = ctypes.windll.user32.GetDpiForWindow(taskbar_hwnd)
+    except Exception:
+        try:
+            hdc = ctypes.windll.user32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+        except Exception:
+            pass
+    _taskbar_log(f"DPI={dpi} ({dpi / 96 * 100:.0f}%)", config)
+
+    # 4. Monitor info (best-effort; not fatal if unavailable)
+    monitor_rect = work_area = None
+    try:
+        hmon = ctypes.windll.user32.MonitorFromRect(
+            ctypes.byref(ctypes.wintypes.RECT(*taskbar_rect)), 2,  # MONITOR_DEFAULTTONEAREST
+        )
+        if hmon:
+            class _MI(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize",    ctypes.wintypes.DWORD),
+                    ("rcMonitor", ctypes.wintypes.RECT),
+                    ("rcWork",    ctypes.wintypes.RECT),
+                    ("dwFlags",   ctypes.wintypes.DWORD),
+                ]
+            mi = _MI()
+            mi.cbSize = ctypes.sizeof(_MI)
+            ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi))
+            r = mi.rcMonitor
+            monitor_rect = (r.left, r.top, r.right, r.bottom)
+            r = mi.rcWork
+            work_area = (r.left, r.top, r.right, r.bottom)
+            _taskbar_log(f"Monitor={monitor_rect}  WorkArea={work_area}", config)
+    except Exception as exc:
+        _taskbar_log(f"GetMonitorInfo failed: {exc}", config)
+
+    # 5. Find the tray child rect
+    children = _w32_enum_children(taskbar_hwnd)
+    tray_hwnd, tray_rect, tray_class, fallback_used = 0, None, "", False
+
+    # Priority 1: TrayNotifyWnd — canonical location of the notification area
+    for child in children:
+        if _w32_class_name(child) == "TrayNotifyWnd":
+            r = _w32_get_rect(child)
+            if r:
+                tray_hwnd, tray_rect, tray_class = child, r, "TrayNotifyWnd"
+                _taskbar_log(
+                    f"TrayNotifyWnd hwnd=0x{child:08X}  rect={r}", config,
+                )
+                break
+
+    # Priority 2: SysPager (sometimes the direct host on older Windows builds)
+    if not tray_rect:
+        for child in children:
+            if _w32_class_name(child) == "SysPager":
+                r = _w32_get_rect(child)
+                if r:
+                    tray_hwnd, tray_rect, tray_class = child, r, "SysPager"
+                    _taskbar_log(
+                        f"SysPager (stand-in) hwnd=0x{child:08X}  rect={r}", config,
+                    )
+                    break
+
+    # Priority 3: rightmost child that plausibly overlaps the right end of the taskbar
+    if not tray_rect:
+        tb_right = taskbar_rect[2]
+        best_hwnd, best_rect, best_cls, best_right = 0, None, "", -1
+        for child in children:
+            r = _w32_get_rect(child)
+            if not r:
+                continue
+            if r[2] < tb_right - 600:          # too far left to be the tray
+                continue
+            if r[3] < taskbar_rect[1] or r[1] > taskbar_rect[3]:  # no vertical overlap
+                continue
+            if r[2] > best_right:
+                best_hwnd, best_rect, best_cls = child, r, _w32_class_name(child)
+                best_right = r[2]
+        if best_rect:
+            tray_hwnd, tray_rect, tray_class = best_hwnd, best_rect, best_cls
+            _taskbar_log(
+                f"Using rightmost child hwnd=0x{best_hwnd:08X}  "
+                f"class={best_cls!r}  rect={best_rect}",
+                config,
+            )
+
+    # Priority 4: synthetic reserved-width fallback (logged loudly)
+    if not tray_rect:
+        fallback_used = True
+        fw = config.fallback_reserved_tray_width_px if config else 300
+        tray_rect = (
+            taskbar_rect[2] - fw, taskbar_rect[1],
+            taskbar_rect[2],      taskbar_rect[3],
+        )
+        _taskbar_log(
+            f"WARNING: no tray child found — using fallback reserved_width={fw}px  "
+            f"synthetic_tray_rect={tray_rect}",
+            config,
+        )
+
+    _taskbar_log(
+        f"Result: source={source!r}  taskbar={taskbar_rect}  tray={tray_rect}  "
+        f"tray_class={tray_class!r}  dpi={dpi}  fallback={fallback_used}",
+        config,
+    )
+    return {
+        "taskbar_rect": taskbar_rect,
+        "tray_rect":    tray_rect,
+        "monitor_rect": monitor_rect,
+        "work_area":    work_area,
+        "tray_hwnd":    tray_hwnd,
+        "tray_class":   tray_class,
+        "fallback_used": fallback_used,
+        "dpi":          dpi,
+        "source":       source,
+    }
+
+
+def find_tray_notification_rect():
+    """Thin backward-compatible wrapper around find_taskbar_tray_rect().
+    Returns {"left", "top", "height"} or None.
+    New callers should use find_taskbar_tray_rect() directly."""
+    if not sys.platform.startswith("win"):
+        return None
+    info = find_taskbar_tray_rect()
+    if not info:
+        return None
+    tray = info["tray_rect"]
+    tb   = info["taskbar_rect"]
+    return {"left": tray[0], "top": tb[1], "height": tb[3] - tb[1]}
+
+
+# --------------------------------------------------------------------------
+# Windows startup registration: HKCU\...\CurrentVersion\Run entry.
+# Uses winreg (stdlib) only -- imported lazily and only on Windows, same
+# lazy-import-behind-a-platform-guard pattern as the ctypes helpers above.
+# No admin rights needed (per-user hive). Registry ops fail soft, same as
+# file I/O elsewhere in this file -- never raise into a long-running thread.
+# --------------------------------------------------------------------------
+
+STARTUP_APP_NAME = "ClaudeUsageTray"   # matches build_exe.bat's --name
+STARTUP_RUN_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def build_startup_command(frozen, executable, script_path):
+    """Pure: decide the command line to register for Windows startup.
+
+    frozen/executable/script_path are explicit (not read from sys.* here)
+    so this is unit-testable on any OS without a real frozen build.
+
+    - frozen=True  -> the executable itself, quoted. A bare invocation
+      with no args already hits the `else: run_app()` branch at the
+      bottom of this file, so no extra args are needed.
+    - frozen=False -> prefers pythonw.exe next to `executable` (avoids a
+      console window flashing at login), falling back to `executable`
+      itself if no pythonw.exe is found alongside it. script_path is
+      quoted and passed as the sole argument.
+    """
+    if frozen:
+        return f'"{executable}"'
+    pythonw = os.path.join(os.path.dirname(executable), "pythonw.exe")
+    interpreter = pythonw if os.path.isfile(pythonw) else executable
+    return f'"{interpreter}" "{script_path}"'
+
+
+def _startup_registry_read(value_name, subkey=None, hive=None):
+    """Read a REG_SZ value from the given registry subkey.
+
+    subkey/hive default to STARTUP_RUN_SUBKEY/HKEY_CURRENT_USER but can be
+    overridden -- used by --test to point at a disposable test subkey
+    instead of the real Run key. Returns the string value, or None on any
+    failure (key/value missing, non-Windows, winreg unavailable,
+    permission error, etc.) Never raises.
+    """
+    if not sys.platform.startswith("win"):
+        return None
+    subkey = subkey if subkey is not None else STARTUP_RUN_SUBKEY
+    try:
+        import winreg
+        root = hive if hive is not None else winreg.HKEY_CURRENT_USER
+        with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ) as key:
+            value, _regtype = winreg.QueryValueEx(key, value_name)
+            return value
+    except (ImportError, OSError):
+        return None
+
+
+def _startup_registry_set(value_name, command, subkey=None, hive=None):
+    """Write value_name = command (REG_SZ) under the given registry
+    subkey, creating the subkey if needed. Returns True on success, False
+    on any failure. Never raises -- this may run on the tray's background
+    thread from a menu click, and must not kill it.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    subkey = subkey if subkey is not None else STARTUP_RUN_SUBKEY
+    try:
+        import winreg
+        root = hive if hive is not None else winreg.HKEY_CURRENT_USER
+        with winreg.CreateKeyEx(root, subkey, 0, winreg.KEY_WRITE) as key:
+            winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, command)
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+def _startup_registry_delete(value_name, subkey=None, hive=None):
+    """Remove value_name from the given registry subkey, if present.
+
+    Returns True if the value is now absent (whether just deleted or
+    already missing), False only on an unexpected failure (e.g.
+    permission error). Never raises.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    subkey = subkey if subkey is not None else STARTUP_RUN_SUBKEY
+    try:
+        import winreg
+        root = hive if hive is not None else winreg.HKEY_CURRENT_USER
+        with winreg.OpenKey(root, subkey, 0, winreg.KEY_WRITE) as key:
+            try:
+                winreg.DeleteValue(key, value_name)
+            except FileNotFoundError:
+                pass  # already absent -- not an error
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+def is_startup_enabled(value_name=None, subkey=None, hive=None):
+    """True if a Run-key entry named value_name currently exists. Any
+    value content counts as enabled -- a stale/renamed-path entry still
+    reads as enabled rather than silently reporting disabled."""
+    value_name = value_name or STARTUP_APP_NAME
+    return _startup_registry_read(value_name, subkey, hive) is not None
+
+
+def set_startup_enabled(enabled, value_name=None, subkey=None, hive=None,
+                          frozen=None, executable=None, script_path=None):
+    """Register or unregister the app for Windows startup.
+
+    frozen/executable/script_path default to the real running process's
+    sys.frozen/sys.executable/abspath(__file__), but are overridable so
+    --test can pass fabricated values without needing a real frozen exe.
+    Returns True on success, False on failure (including non-Windows,
+    where it's always a no-op False).
+    """
+    value_name = value_name or STARTUP_APP_NAME
+    if enabled:
+        frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+        executable = sys.executable if executable is None else executable
+        script_path = os.path.abspath(__file__) if script_path is None else script_path
+        command = build_startup_command(frozen, executable, script_path)
+        return _startup_registry_set(value_name, command, subkey, hive)
+    else:
+        return _startup_registry_delete(value_name, subkey, hive)
 
 
 # --------------------------------------------------------------------------
@@ -382,6 +883,69 @@ def read_usage_cache(cache_path=None):
         return None
 
 
+def install_statusline_hook(settings_path, script_path):
+    """Merge the statusLine hook entry into Claude Code's settings.json.
+
+    Returns (success: bool, message: str).
+    Never touches the file if it can't be parsed cleanly — safer than
+    risking a corrupt settings.json (one stray comma kills the whole file).
+    """
+    command = "python " + script_path.replace("\\", "/") + " --statusline-hook"
+    desired = {"type": "command", "command": command}
+
+    # Read existing settings (or start fresh if the file doesn't exist yet)
+    settings = {}
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return False, (
+                f"settings.json exists but couldn't be parsed: {exc}\n"
+                "Fix the JSON manually, then re-run --install-hook."
+            )
+        except OSError as exc:
+            return False, f"Couldn't read settings.json: {exc}"
+
+    existing = settings.get("statusLine")
+    if existing == desired:
+        return True, "statusLine hook already configured — nothing to change."
+
+    if existing is not None:
+        msg_prefix = f"Replacing existing statusLine:\n  {json.dumps(existing)}\nwith:"
+    else:
+        msg_prefix = "Adding statusLine:"
+
+    settings["statusLine"] = desired
+
+    try:
+        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+        tmp = settings_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, settings_path)
+    except OSError as exc:
+        return False, f"Couldn't write settings.json: {exc}"
+
+    return True, (
+        f"{msg_prefix}\n  {json.dumps(desired)}\n"
+        f"Written to: {settings_path}\n"
+        "Restart Claude Code for the change to take effect."
+    )
+
+
+def run_install_hook():
+    """Entry point for --install-hook: wires this script into Claude Code's
+    settings.json as the statusLine command."""
+    settings_path = os.path.join(CLAUDE_HOME, "settings.json")
+    script_path = os.path.abspath(__file__)
+    success, message = install_statusline_hook(settings_path, script_path)
+    print(message)
+    if not success:
+        sys.exit(1)
+
+
 def run_statusline_hook():
     """Entry point for `python claude_usage_tray.py --statusline-hook`,
     meant to be wired up as Claude Code's `statusLine` command (see
@@ -412,6 +976,13 @@ def run_app():
     FALLBACK_SWEEP_SECONDS = 30   # safety-net full rescan interval
     WATCHER_RETRY_SECONDS = 5     # retry interval if projects dir doesn't exist yet
     WIDGET_POS_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_pos.json")
+    ALIGNMENT_CONFIG_PATH = os.path.join(CLAUDE_HOME, "usage_tray_alignment.json")
+    WIDGET_PIN_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_pin.json")
+    WIDGET_FAVORITE_POS_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_favorite_pos.json")
+
+    ALIGNMENT_CONFIG = TaskbarAlignmentConfig()
+    _saved_align = read_usage_cache(cache_path=ALIGNMENT_CONFIG_PATH) or {}
+    ALIGNMENT_CONFIG.enabled = _saved_align.get("enabled", True)
     WIDGET_COLORS = {
         "green": "#5fb85f", "yellow": "#e0b341", "red": "#e0605a", "dim": "#888888",
     }
@@ -421,6 +992,16 @@ def run_app():
     widget_visible = threading.Event()
     widget_visible.set()  # shown by default
     should_quit = threading.Event()
+    position_pinned = threading.Event()
+    _saved_pin = read_usage_cache(cache_path=WIDGET_PIN_PATH) or {}
+    if _saved_pin.get("pinned", False):
+        position_pinned.set()
+    load_favorite_requested = threading.Event()
+    widget = None  # reassigned to the real FloatingWidget near the end of
+                   # run_app(); forward-declared so on_save_favorite/
+                   # on_load_favorite (tray thread, defined below) can
+                   # reference it as a free variable without a NameError if
+                   # clicked in the sub-second window before it's constructed.
 
     def current_snapshot():
         with state_lock:
@@ -440,72 +1021,202 @@ def run_app():
 
         BAR_W, BAR_H = 90, 10
         BG, FG, DIM, TRACK = "#1e1e1e", "#e6e6e6", "#888888", "#3a3a3a"
+        # COLORREF (0x00BBGGRR) for BG="#1e1e1e"; used as colorkey so the
+        # background is punched through in idle mode (data-only, no dark panel).
+        _BG_COLORREF = 0x001E1E1E
 
         def __init__(self):
             self.root = tk.Tk()
             self.root.overrideredirect(True)
-            self.root.attributes("-topmost", True)
-            try:
-                self.root.attributes("-alpha", 0.92)
-            except tk.TclError:
-                pass
             self.root.configure(bg=self.BG)
 
-            frame = tk.Frame(self.root, bg=self.BG, padx=10, pady=8)
+            # 2-row layout: today on row 1, session+weekly combined on row 2.
+            # 2 rows of 9pt Consolas always fit in any standard taskbar (40\u201360px)
+            # without font scaling.  Row 2 is wider than a single metric row was,
+            # which is what makes the widget "wider" to compensate for being shorter.
+            import tkinter.font as tkfont
+            _tb_info = find_taskbar_tray_rect(ALIGNMENT_CONFIG)
+            _tb_h = ((_tb_info["taskbar_rect"][3] - _tb_info["taskbar_rect"][1])
+                     if _tb_info else 48)   # 48px: Win11 @ 100% DPI fallback
+            self._tb_h = _tb_h
+            for _fs in (9, 8, 7, 6):
+                _lh = tkfont.Font(family="Consolas", size=_fs).metrics("linespace")
+                if 2 * _lh <= _tb_h:
+                    break
+            self._fs = _fs
+            self.BAR_H = max(4, min(10, _lh - 2))   # shadows class-level BAR_H
+            self.BAR_W = 65                           # shadows class-level BAR_W=90
+            _slack        = max(0, _tb_h - 2 * _lh)
+            _frame_pady   = min(4, _slack // 4)
+            _slack       -= 2 * _frame_pady
+            _today_pady   = min(2, _slack // 3)
+            _slack       -= 2 * _today_pady
+            self._row_pady = min(1, _slack // 4)
+
+            frame = tk.Frame(self.root, bg=self.BG, padx=10, pady=_frame_pady)
             frame.pack(fill="both", expand=True)
 
-            title_row = tk.Frame(frame, bg=self.BG)
-            title_row.pack(fill="x")
-            tk.Label(
-                title_row, text="Claude Code", font=("Consolas", 9, "bold"),
-                fg=self.FG, bg=self.BG,
-            ).pack(side="left")
-            close_btn = tk.Label(
-                title_row, text="\u2715", font=("Consolas", 9, "bold"),
-                fg=self.DIM, bg=self.BG, cursor="hand2",
-            )
-            close_btn.pack(side="right")
-            close_btn.bind("<Button-1>", lambda e: widget_visible.clear())
-
             self.today_label = tk.Label(
-                frame, font=("Consolas", 9), fg=self.FG, bg=self.BG, anchor="w",
+                frame, font=("Consolas", _fs), fg=self.FG, bg=self.BG, anchor="w",
             )
-            self.today_label.pack(fill="x", pady=(4, 4))
+            self.today_label.pack(fill="x", pady=(_today_pady, _today_pady))
 
-            self.session_canvas, self.session_pct_lbl, self.session_reset_lbl, session_row = (
-                self._build_metric_row(frame, "Session 5h")
-            )
-            self.weekly_canvas, self.weekly_pct_lbl, self.weekly_reset_lbl, weekly_row = (
-                self._build_metric_row(frame, "Weekly  7d")
-            )
+            # Single row: session 5h and weekly 7d side-by-side
+            metrics_row = tk.Frame(frame, bg=self.BG)
+            metrics_row.pack(fill="x", pady=self._row_pady)
 
-            for w in (self.root, frame, title_row, self.today_label, session_row, weekly_row):
+            tk.Label(metrics_row, text="5h", font=("Consolas", _fs), fg=self.FG, bg=self.BG,
+                     ).pack(side="left", padx=(0, 4))
+            self.session_canvas = tk.Canvas(
+                metrics_row, width=self.BAR_W, height=self.BAR_H, bg=self.BG, highlightthickness=0,
+            )
+            self.session_canvas.pack(side="left", padx=(0, 4))
+            self.session_reset_lbl = tk.Label(
+                metrics_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG, anchor="w",
+            )
+            self.session_reset_lbl.pack(side="left", padx=(4, 10))
+
+            tk.Label(metrics_row, text="\u00b7", font=("Consolas", _fs), fg=self.DIM, bg=self.BG,
+                     ).pack(side="left", padx=(0, 10))
+
+            tk.Label(metrics_row, text="7d", font=("Consolas", _fs), fg=self.FG, bg=self.BG,
+                     ).pack(side="left", padx=(0, 4))
+            self.weekly_canvas = tk.Canvas(
+                metrics_row, width=self.BAR_W, height=self.BAR_H, bg=self.BG, highlightthickness=0,
+            )
+            self.weekly_canvas.pack(side="left", padx=(0, 4))
+            self.weekly_reset_lbl = tk.Label(
+                metrics_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG, anchor="w",
+            )
+            self.weekly_reset_lbl.pack(side="left", padx=(4, 0))
+
+            for w in (self.root, frame, self.today_label, metrics_row):
                 w.bind("<Button-1>", self._start_drag)
                 w.bind("<B1-Motion>", self._do_drag)
                 w.bind("<ButtonRelease-1>", self._end_drag)
 
             self._drag_offset = (0, 0)
+            self._last_alignment_check = 0.0
+            self._topmost_hwnd = None  # resolved on first _reassert_topmost call
+            self._dragging = False
+            self._win_event_hook = None   # WinEventHook handle (Windows only)
+            self._win_event_proc = None   # keep reference — ctypes GC will break the hook
+            self._overlay_hwnd = None     # resolved by _apply_overlay_styles()
             self._render()                  # render real content first...
             self.root.update_idletasks()    # ...so reqwidth/reqheight reflect it...
             self._place_initial()           # ...before sizing/positioning the window.
+            self.root.update_idletasks()    # flush geometry to Win32 before style changes
+            # Mirrors the widget's current screen position into a plain tuple so
+            # a tray-thread callback (on_save_favorite) can read "where is the
+            # widget right now" without ever calling a Tkinter method itself.
+            # Only ever written from the Tk thread (here, in _tick(), and in
+            # _end_drag()) -- read cross-thread the same way ALIGNMENT_CONFIG.enabled
+            # already is.
+            self.last_known_pos = (self.root.winfo_x(), self.root.winfo_y())
+            self._apply_overlay_styles()    # atomic Win32 layered-overlay setup
+            self._set_transparent(True)
+            self.root.after(150, self._fast_tick)
             self.root.after(1000, self._tick)
 
-        def _build_metric_row(self, parent, name):
-            row = tk.Frame(parent, bg=self.BG)
-            row.pack(fill="x", pady=2)
-            tk.Label(
-                row, text=name, font=("Consolas", 9), fg=self.FG, bg=self.BG,
-                width=10, anchor="w",
-            ).pack(side="left")
-            canvas = tk.Canvas(
-                row, width=self.BAR_W, height=self.BAR_H, bg=self.BG, highlightthickness=0,
-            )
-            canvas.pack(side="left", padx=(0, 6))
-            pct_lbl = tk.Label(row, font=("Consolas", 9, "bold"), bg=self.BG, width=4, anchor="e")
-            pct_lbl.pack(side="left")
-            reset_lbl = tk.Label(row, font=("Consolas", 9), fg=self.DIM, bg=self.BG, anchor="w")
-            reset_lbl.pack(side="left", padx=(6, 0))
-            return canvas, pct_lbl, reset_lbl, row
+        def _apply_overlay_styles(self):
+            """Apply WS_EX_LAYERED + WS_EX_TOPMOST + WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE
+            atomically, then configure LWA_COLORKEY+LWA_ALPHA for per-pixel
+            transparency and promote z-order via SetWindowPos(HWND_TOPMOST).
+            All in one place so there is exactly one WM_STYLECHANGED, not three."""
+            if not sys.platform.startswith("win"):
+                return
+            try:
+                import ctypes
+                import ctypes.wintypes
+                GWL_EXSTYLE      = -20
+                WS_EX_LAYERED    = 0x00080000
+                WS_EX_TOOLWINDOW = 0x00000080
+                WS_EX_NOACTIVATE = 0x08000000
+                LWA_ALPHA        = 0x2
+
+                inner = self.root.winfo_id()
+                outer = ctypes.windll.user32.GetAncestor(inner, 2) or inner
+                self._overlay_hwnd = outer
+                self._topmost_hwnd = outer  # used by _reassert_topmost
+
+                # ONE SetWindowLongW — avoids the WM_STYLECHANGED storm that the
+                # old code caused by calling it separately for each style bit.
+                # WS_EX_TOPMOST is intentionally NOT set here; SetWindowPos manages it.
+                cur = ctypes.windll.user32.GetWindowLongW(outer, GWL_EXSTYLE)
+                ctypes.windll.user32.SetWindowLongW(
+                    outer, GWL_EXSTYLE,
+                    cur | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                )
+
+                # Placeholder: alpha=1, no colorkey.  _set_transparent(True) is
+                # called immediately after and switches to colorkey+255 (idle mode).
+                ctypes.windll.user32.SetLayeredWindowAttributes(
+                    outer, 0, 1, LWA_ALPHA,
+                )
+
+                # Schedule NOTOPMOST→TOPMOST for the first mainloop iteration.
+                # We do NOT call root.attributes("-topmost", True) here because
+                # that call goes through Tk's WM machinery and triggers a
+                # SetWindowPos internally, which (while the geometry from
+                # _place_initial is still being committed) cancels the pending
+                # window move and leaves the widget stuck at (0, 0).
+                # The after(0) fires after the geometry is fully applied.
+                self.root.after(0, self._reassert_topmost)
+
+                # Event-driven z-order recovery: fires when any window becomes
+                # foreground (e.g. user clicks taskbar).  WINEVENT_OUTOFCONTEXT=0
+                # routes the callback through our message queue — no in-process DLL.
+                _WinEventProc = ctypes.WINFUNCTYPE(
+                    None,
+                    ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD,
+                    ctypes.wintypes.HWND,   ctypes.wintypes.LONG,
+                    ctypes.wintypes.LONG,   ctypes.wintypes.DWORD,
+                    ctypes.wintypes.DWORD,
+                )
+                def _on_foreground_change(_h, _e, _w, _o, _c, _t, _ms):
+                    self._reassert_topmost()
+                self._win_event_proc = _WinEventProc(_on_foreground_change)
+                self._win_event_hook = ctypes.windll.user32.SetWinEventHook(
+                    0x0003, 0x0003, None, self._win_event_proc,
+                    0, 0, 0x0000,
+                )
+
+            except Exception as exc:
+                print(f"[overlay] WARNING: failed to apply overlay styles: {exc}")
+
+        def _set_alpha(self, alpha_byte, *, colorkey=False):
+            """Set window opacity via SetLayeredWindowAttributes.
+            colorkey=True → also punch through the BG colour so only the data
+            (text, bars) is visible; the dark panel background disappears.
+            Does NOT trigger WM_STYLECHANGED (unlike SetWindowLongW)."""
+            if sys.platform.startswith("win") and self._overlay_hwnd:
+                try:
+                    import ctypes
+                    if colorkey:
+                        ctypes.windll.user32.SetLayeredWindowAttributes(
+                            self._overlay_hwnd, self._BG_COLORREF, alpha_byte,
+                            0x3,   # LWA_COLORKEY | LWA_ALPHA
+                        )
+                    else:
+                        ctypes.windll.user32.SetLayeredWindowAttributes(
+                            self._overlay_hwnd, 0, alpha_byte, 0x2,   # LWA_ALPHA only
+                        )
+                except Exception:
+                    pass
+            else:
+                # Non-Windows: no colorkey support; best effort is full visibility.
+                try:
+                    self.root.attributes("-alpha", 1.0 if colorkey else alpha_byte / 255)
+                except Exception:
+                    pass
+
+        def _set_transparent(self, on):
+            """on=True → idle: data fully visible, background punched through.
+            on=False → drag: background panel visible at 92%."""
+            if on:
+                self._set_alpha(255, colorkey=True)
+            else:
+                self._set_alpha(235)
 
         def _draw_bar(self, canvas, pct):
             canvas.delete("all")
@@ -515,15 +1226,21 @@ def run_app():
                 canvas.create_rectangle(
                     0, 0, fill_w, self.BAR_H, fill=WIDGET_COLORS[pct_tag(pct)], outline="",
                 )
+                label, text_color = f"{pct:.0f}%", "#ffffff"
+            else:
+                label, text_color = "--", self.DIM
+            canvas.create_text(
+                self.BAR_W // 2, self.BAR_H // 2,
+                text=label, fill=text_color,
+                font=("Consolas", self._fs, "bold"), anchor="center",
+            )
 
-        def _render_metric_row(self, canvas, pct_lbl, reset_lbl, pct, resets_at):
+        def _render_metric_row(self, canvas, reset_lbl, pct, resets_at):
             self._draw_bar(canvas, pct)
             if pct is not None:
-                pct_lbl.config(text=f"{pct:.0f}%", fg=WIDGET_COLORS[pct_tag(pct)])
-                reset_lbl.config(text=f"resets {fmt_reset_clock(resets_at) or '?'}", fg=self.DIM)
+                reset_lbl.config(text=fmt_reset_clock(resets_at) or "?", fg=self.DIM)
             else:
-                pct_lbl.config(text="--", fg=self.DIM)
-                reset_lbl.config(text="(needs statusLine hook)", fg=self.DIM)
+                reset_lbl.config(text="--", fg=self.DIM)
 
         def _render(self):
             snap = current_snapshot()
@@ -533,18 +1250,115 @@ def run_app():
             )
             cache = read_usage_cache() or {}
             self._render_metric_row(
-                self.session_canvas, self.session_pct_lbl, self.session_reset_lbl,
+                self.session_canvas, self.session_reset_lbl,
                 cache.get("session_used_percentage"), cache.get("session_resets_at"),
             )
             self._render_metric_row(
-                self.weekly_canvas, self.weekly_pct_lbl, self.weekly_reset_lbl,
+                self.weekly_canvas, self.weekly_reset_lbl,
                 cache.get("weekly_used_percentage"), cache.get("weekly_resets_at"),
             )
 
+        def _compute_aligned_position(self, w, h, info):
+            """Return (x, y) in physical pixels for the aligned position.
+
+            Applies the gap, vertical mode, and monitor-clamp from
+            ALIGNMENT_CONFIG.  All values are physical-pixel coordinates
+            matching the Win32 rects returned by find_taskbar_tray_rect().
+            """
+            tray = info["tray_rect"]
+            tb   = info["taskbar_rect"]
+            mon  = info.get("monitor_rect") or tb
+
+            x = tray[0] - w - ALIGNMENT_CONFIG.gap_px
+
+            if ALIGNMENT_CONFIG.vertical_mode == "inside-taskbar":
+                tb_h = tb[3] - tb[1]
+                y = tb[1] + (tb_h - h) // 2 + ALIGNMENT_CONFIG.vertical_offset_px
+            else:  # "above-taskbar"
+                y = (tb[1] - h
+                     + ALIGNMENT_CONFIG.overlap_px
+                     + ALIGNMENT_CONFIG.vertical_offset_px)
+
+            # Clamp so the widget stays within the monitor
+            x = max(mon[0], min(x, mon[2] - w))
+            y = max(mon[1], min(y, mon[3] - h))
+
+            _taskbar_log(
+                f"aligned position: {w}x{h}+{x}+{y}  tray_left={tray[0]}  "
+                f"gap={ALIGNMENT_CONFIG.gap_px}  tb={tb[1]}-{tb[3]}",
+                ALIGNMENT_CONFIG,
+            )
+            return x, y
+
+        def _recheck_alignment(self):
+            """Recompute and apply the aligned position (called from _tick).
+
+            Uses the actual rendered window size (winfo_width/height) rather
+            than the requisition size, so it stays correct after any resize.
+            Repositions via geometry() without altering the window size.
+            """
+            self._last_alignment_check = time.monotonic()
+            info = find_taskbar_tray_rect(ALIGNMENT_CONFIG)
+            if not info:
+                return
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            if w < 1 or h < 1:
+                w, h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
+            x, y = self._compute_aligned_position(w, h, info)
+            self.root.geometry(f"+{int(x)}+{int(y)}")
+
+        def _apply_favorite_position(self):
+            """Tk-thread-only, invoked from _tick() when load_favorite_requested
+            was set by on_load_favorite() (tray thread). Never call this, or
+            touch self.root, from an on_* tray callback directly -- see
+            ARCHITECTURE.md §5 on cross-thread Tkinter calls.
+
+            Disables taskbar alignment (same as a manual drag) so the 30s
+            re-align check in _tick() doesn't immediately undo the loaded
+            position, and persists the new position to WIDGET_POS_PATH so a
+            restart keeps the loaded favorite as the last-known position.
+            """
+            if position_pinned.is_set():
+                return
+            saved = read_usage_cache(cache_path=WIDGET_FAVORITE_POS_PATH)
+            if not saved or saved.get("x") is None or saved.get("y") is None:
+                return
+            x, y = int(saved["x"]), int(saved["y"])
+            self.root.geometry(f"+{x}+{y}")
+            # Flush the queued move to the real Win32 window *now* -- _tick()
+            # calls _reassert_topmost() right after this method returns, which
+            # does a synchronous SetWindowPos via root.attributes("-topmost", ...).
+            # Without this flush, that call can win the race and the pending
+            # geometry change is silently dropped -- the same class of bug as
+            # the _place_initial()/_apply_overlay_styles() ordering documented
+            # in ARCHITECTURE.md §6.
+            self.root.update_idletasks()
+            self.last_known_pos = (x, y)
+            if ALIGNMENT_CONFIG.enabled:
+                ALIGNMENT_CONFIG.enabled = False
+                write_usage_cache({"enabled": False}, cache_path=ALIGNMENT_CONFIG_PATH)
+            write_usage_cache({"x": x, "y": y}, cache_path=WIDGET_POS_PATH)
+
         def _place_initial(self):
-            saved = read_usage_cache(cache_path=WIDGET_POS_PATH)
             w = self.root.winfo_reqwidth()
             h = self.root.winfo_reqheight()
+
+            if ALIGNMENT_CONFIG.enabled:
+                if ALIGNMENT_CONFIG.debug_logging:
+                    diagnose_taskbar_windows(ALIGNMENT_CONFIG)
+                info = find_taskbar_tray_rect(ALIGNMENT_CONFIG)
+                if info:
+                    self._last_alignment_check = time.monotonic()
+                    x, y = self._compute_aligned_position(w, h, info)
+                    self.root.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
+                    return
+                _taskbar_log(
+                    "alignment enabled but taskbar not found — using saved/heuristic",
+                    ALIGNMENT_CONFIG,
+                )
+
+            saved = read_usage_cache(cache_path=WIDGET_POS_PATH)
             if saved and saved.get("x") is not None and saved.get("y") is not None:
                 x, y = saved["x"], saved["y"]
             else:
@@ -552,45 +1366,148 @@ def run_app():
             self.root.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
 
         def _default_position(self, w, h):
-            """On first run (no saved drag position), try to sit just to
-            the left of the real taskbar notification area (where the
-            tray icons live). Falls back to a screen-corner estimate if
-            that can't be detected (non-Windows, pywin32 missing, or the
-            lookup fails for any reason)."""
-            tray = find_tray_notification_rect()
-            if tray:
-                x = tray["left"] - w - 8
-                y = tray["top"] + (tray["height"] - h) // 2
-                return x, y
+            """Heuristic fallback when alignment is off and no drag position is saved.
+            Tries the tray rect first; falls back to a screen-corner estimate."""
+            info = find_taskbar_tray_rect(ALIGNMENT_CONFIG)
+            if info:
+                return self._compute_aligned_position(w, h, info)
             sw = self.root.winfo_screenwidth()
             sh = self.root.winfo_screenheight()
             return sw - w - 220, sh - h - 50
 
         def _start_drag(self, event):
+            if position_pinned.is_set():
+                return
             self._drag_offset = (
                 event.x_root - self.root.winfo_x(),
                 event.y_root - self.root.winfo_y(),
             )
+            self._dragging = True
+            self._set_transparent(False)
 
         def _do_drag(self, event):
+            if position_pinned.is_set():
+                return
             x = event.x_root - self._drag_offset[0]
             y = event.y_root - self._drag_offset[1]
             self.root.geometry(f"+{x}+{y}")
 
         def _end_drag(self, event):
+            # Dragging disables alignment so the widget stays where the user puts it.
+            # Re-enable via the tray menu "Align to taskbar tray" item.
+            if ALIGNMENT_CONFIG.enabled:
+                ALIGNMENT_CONFIG.enabled = False
+                write_usage_cache({"enabled": False}, cache_path=ALIGNMENT_CONFIG_PATH)
+            self.last_known_pos = (self.root.winfo_x(), self.root.winfo_y())
             write_usage_cache(
-                {"x": self.root.winfo_x(), "y": self.root.winfo_y()},
+                {"x": self.last_known_pos[0], "y": self.last_known_pos[1]},
                 cache_path=WIDGET_POS_PATH,
             )
+            self._dragging = False
+            # Stay at hover alpha if mouse is still over the widget; else go idle.
+            mx, my = event.x_root, event.y_root
+            wx = self.root.winfo_rootx()
+            wy = self.root.winfo_rooty()
+            ww = self.root.winfo_width()
+            wh = self.root.winfo_height()
+            if wx <= mx < wx + ww and wy <= my < wy + wh:
+                self._set_alpha(191)
+            else:
+                self._set_alpha(255, colorkey=True)
+
+        def _zorder_vs_taskbar(self):
+            """Walk the z-order chain from the top and return our position
+            relative to Shell_TrayWnd: 'above', 'below', or 'unknown'."""
+            if not sys.platform.startswith("win") or not self._topmost_hwnd:
+                return "unknown"
+            try:
+                import ctypes
+                taskbar = _w32_find_window("Shell_TrayWnd")
+                if not taskbar:
+                    return "unknown"
+                GW_HWNDNEXT = 2
+                chain = []
+                hwnd = ctypes.windll.user32.GetTopWindow(0)
+                while hwnd:
+                    chain.append(hwnd)
+                    hwnd = ctypes.windll.user32.GetWindow(hwnd, GW_HWNDNEXT)
+                return _zorder_position(chain, self._topmost_hwnd, taskbar)
+            except Exception:
+                return "error"
+
+        def _reassert_topmost(self):
+            """Re-promote the widget to the very top of the HWND_TOPMOST z-layer.
+
+            Must go through root.attributes("-topmost") rather than raw ctypes
+            SetWindowPos because Tkinter's WndProc intercepts WM_WINDOWPOSCHANGING
+            and silently reverts any topmost promotion that did not originate from
+            Tk's own machinery (it checks its internal wmPtr->flags and cancels
+            external SetWindowPos(HWND_TOPMOST) calls).
+
+            NOTOPMOST first: SetWindowPos(HWND_TOPMOST) on a window already in the
+            topmost group is a z-order no-op — "remains in its original location."
+            Setting NOTOPMOST first re-enters the window as a new TOPMOST entrant,
+            placing it above all other topmost windows including the taskbar.
+            Both steps are synchronous with no message-loop iteration between them
+            so there is no DWM repaint of the briefly-not-topmost state.
+            """
+            if not sys.platform.startswith("win"):
+                return
+            try:
+                self.root.attributes("-topmost", False)
+                self.root.attributes("-topmost", True)
+            except Exception:
+                pass
+
+        def _fast_tick(self):
+            """Runs every 150ms: drives hover alpha.
+            Topmost z-order is managed by the WinEvent hook (event-driven),
+            not polled here — that was the 'normal always-on-top' approach."""
+            if should_quit.is_set():
+                return
+            if widget_visible.is_set() and not self._dragging:
+                try:
+                    mx = self.root.winfo_pointerx()
+                    my = self.root.winfo_pointery()
+                    wx = self.root.winfo_rootx()
+                    wy = self.root.winfo_rooty()
+                    ww = self.root.winfo_width()
+                    wh = self.root.winfo_height()
+                    inside = wx <= mx < wx + ww and wy <= my < wy + wh
+                    if inside:
+                        self._set_alpha(191)
+                    else:
+                        self._set_alpha(255, colorkey=True)
+                except Exception:
+                    pass
+            self.root.after(150, self._fast_tick)
 
         def _tick(self):
             if should_quit.is_set():
+                if self._win_event_hook:
+                    try:
+                        import ctypes
+                        ctypes.windll.user32.UnhookWinEvent(self._win_event_hook)
+                    except Exception:
+                        pass
                 self.root.quit()
                 return
+            if load_favorite_requested.is_set():
+                load_favorite_requested.clear()
+                self._apply_favorite_position()
             if widget_visible.is_set():
                 if not self.root.winfo_viewable():
                     self.root.deiconify()
+                    self._set_transparent(True)
                 self._render()
+                self._reassert_topmost()   # 1-second safety net for z-order
+                # Periodically re-align to the tray (handles taskbar moves, DPI changes,
+                # monitor layout changes, and tray overflow expand/collapse).
+                if ALIGNMENT_CONFIG.enabled:
+                    now = time.monotonic()
+                    if now - self._last_alignment_check > 30.0:
+                        self._recheck_alignment()
+                self.last_known_pos = (self.root.winfo_x(), self.root.winfo_y())
             else:
                 self.root.withdraw()
             self.root.after(1000, self._tick)
@@ -600,13 +1517,49 @@ def run_app():
 
 
     def make_icon_image():
+        # Drawn as a speedometer-style usage gauge -- green/yellow/red bands
+        # plus a needle -- using the same thresholds as pct_tag()/
+        # WIDGET_COLORS, so the tray icon is a tiny picture of what the app
+        # actually shows. Drawn at 4x and downsampled for anti-aliased edges;
+        # kept in sync by hand with generate_icon.py, which produces the
+        # static icon.ico used for the packaged .exe's own file icon.
         size = 64
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        scale = 4
+        s = size * scale
+        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        draw.ellipse((2, 2, size - 2, size - 2), fill=(204, 120, 92, 255))
-        draw.ellipse((10, 10, size - 10, size - 10), fill=(255, 255, 255, 230))
-        draw.ellipse((20, 20, size - 20, size - 20), fill=(204, 120, 92, 255))
-        return img
+
+        margin = s * 0.06
+        bbox = (margin, margin, s - margin, s - margin)
+        cx = cy = s / 2
+        r = (s - 2 * margin) / 2
+
+        gap_deg = 90
+        sweep = 360 - gap_deg
+        start = 90 + gap_deg / 2  # Pillow angles: 0=east, 90=south, clockwise
+        green_end = start + sweep * 0.50
+        yellow_end = green_end + sweep * 0.30
+        red_end = yellow_end + sweep * 0.20
+
+        draw.pieslice(bbox, start, green_end, fill=(95, 184, 95, 255))
+        draw.pieslice(bbox, green_end, yellow_end, fill=(224, 179, 65, 255))
+        draw.pieslice(bbox, yellow_end, red_end, fill=(224, 96, 90, 255))
+
+        # Punch a hole through the middle so the wedges read as a ring/gauge
+        # face rather than a solid pie.
+        hole_r = r * 0.55
+        draw.ellipse((cx - hole_r, cy - hole_r, cx + hole_r, cy + hole_r), fill=(0, 0, 0, 0))
+
+        needle_angle = math.radians(start + sweep * 0.62)
+        needle_len = r * 0.98
+        nx = cx + needle_len * math.cos(needle_angle)
+        ny = cy + needle_len * math.sin(needle_angle)
+        draw.line((cx, cy, nx, ny), fill=(45, 42, 40, 255), width=max(1, round(s * 0.05)))
+
+        pivot_r = s * 0.09
+        draw.ellipse((cx - pivot_r, cy - pivot_r, cx + pivot_r, cy + pivot_r), fill=(45, 42, 40, 255))
+
+        return img.resize((size, size), Image.LANCZOS)
 
     def build_title():
         snap = current_snapshot()
@@ -690,6 +1643,28 @@ def run_app():
             on_toggle_widget,
             checked=lambda item: widget_visible.is_set(),
         ))
+        items.append(pystray.MenuItem(
+            "Align to taskbar tray",
+            on_toggle_alignment,
+            checked=lambda item: ALIGNMENT_CONFIG.enabled,
+        ))
+        items.append(pystray.MenuItem(
+            "Pin position",
+            on_toggle_pin,
+            checked=lambda item: position_pinned.is_set(),
+        ))
+        items.append(pystray.MenuItem(
+            "Run on Windows startup",
+            on_toggle_startup,
+            checked=lambda item: is_startup_enabled(),
+            enabled=lambda item: sys.platform.startswith("win"),
+        ))
+        items.append(pystray.MenuItem("Save current position as favorite", on_save_favorite))
+        items.append(pystray.MenuItem(
+            "Load favorite position",
+            on_load_favorite,
+            enabled=lambda item: read_usage_cache(cache_path=WIDGET_FAVORITE_POS_PATH) is not None,
+        ))
         items.append(pystray.MenuItem("Refresh now", on_refresh))
         items.append(pystray.MenuItem("Open logs folder", on_open_folder))
         items.append(pystray.MenuItem("Quit", on_quit))
@@ -712,6 +1687,44 @@ def run_app():
                 os.startfile(PROJECTS_DIR)  # noqa: S606
             else:
                 subprocess.Popen(["xdg-open", PROJECTS_DIR])
+
+    def on_toggle_alignment(icon, item):
+        ALIGNMENT_CONFIG.enabled = not ALIGNMENT_CONFIG.enabled
+        write_usage_cache({"enabled": ALIGNMENT_CONFIG.enabled}, cache_path=ALIGNMENT_CONFIG_PATH)
+
+    def on_toggle_pin(icon, item):
+        if position_pinned.is_set():
+            position_pinned.clear()
+            write_usage_cache({"pinned": False}, cache_path=WIDGET_PIN_PATH)
+        else:
+            position_pinned.set()
+            write_usage_cache({"pinned": True}, cache_path=WIDGET_PIN_PATH)
+
+    def on_toggle_startup(icon, item):
+        # Tray thread. Fails soft -- see set_startup_enabled()/_startup_registry_*.
+        # The registry value itself is the source of truth, re-read fresh
+        # here and in the checked= lambda above -- no in-memory mirror needed.
+        set_startup_enabled(not is_startup_enabled())
+
+    def on_save_favorite(icon, item):
+        # Tray thread. Reads the widget's position mirror (a plain tuple kept
+        # fresh by the Tk thread's _tick()/_end_drag()) -- never calls a
+        # Tkinter method directly, per ARCHITECTURE.md §5.
+        if widget is None:
+            return  # clicked before FloatingWidget() finished constructing
+        x, y = widget.last_known_pos
+        write_usage_cache({"x": x, "y": y}, cache_path=WIDGET_FAVORITE_POS_PATH)
+
+    def on_load_favorite(icon, item):
+        # Tray thread. Never touches widget.root directly -- just signals the
+        # Tk thread via an Event, same pattern as should_quit/widget_visible.
+        # The actual geometry() call happens inside
+        # FloatingWidget._tick() -> _apply_favorite_position().
+        if position_pinned.is_set():
+            return
+        if read_usage_cache(cache_path=WIDGET_FAVORITE_POS_PATH) is None:
+            return
+        load_favorite_requested.set()
 
     def on_quit(icon, item):
         should_quit.set()
@@ -960,10 +1973,308 @@ def run_tests():
         assert pct_tag(None) == "dim"
         print("Widget color-threshold helper: OK")
 
+        # --- statusLine hook installation ---
+        fake_script = "/path/to/claude_usage_tray.py"
+        expected_cmd = f"python {fake_script} --statusline-hook"
+        expected_block = {"type": "command", "command": expected_cmd}
+
+        # Case 1: fresh install (no settings.json)
+        settings_path = os.path.join(tmp_home, "settings_fresh.json")
+        ok, msg = install_statusline_hook(settings_path, fake_script)
+        assert ok, msg
+        with open(settings_path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["statusLine"] == expected_block, data
+        print("hook install — fresh file: OK")
+
+        # Case 2: existing settings with unrelated keys (keys must be preserved)
+        settings_path2 = os.path.join(tmp_home, "settings_merge.json")
+        with open(settings_path2, "w", encoding="utf-8") as f:
+            json.dump({"theme": "dark", "autoUpdates": False}, f)
+        ok, msg = install_statusline_hook(settings_path2, fake_script)
+        assert ok, msg
+        with open(settings_path2, encoding="utf-8") as f:
+            data2 = json.load(f)
+        assert data2["theme"] == "dark"
+        assert data2["autoUpdates"] is False
+        assert data2["statusLine"] == expected_block
+        print("hook install — merges with existing keys: OK")
+
+        # Case 3: already configured with the same command (no-op)
+        ok3, msg3 = install_statusline_hook(settings_path2, fake_script)
+        assert ok3, msg3
+        assert "already" in msg3.lower()
+        print("hook install — already configured, no-op: OK")
+
+        # Case 4: existing statusLine with a different command (overwritten)
+        settings_path3 = os.path.join(tmp_home, "settings_overwrite.json")
+        with open(settings_path3, "w", encoding="utf-8") as f:
+            json.dump({"statusLine": {"type": "command", "command": "old-cmd"}}, f)
+        ok4, msg4 = install_statusline_hook(settings_path3, fake_script)
+        assert ok4, msg4
+        with open(settings_path3, encoding="utf-8") as f:
+            data3 = json.load(f)
+        assert data3["statusLine"] == expected_block
+        assert "old-cmd" in msg4  # message must mention the old value
+        print("hook install — overwrites different command: OK")
+
+        # Case 5: malformed settings.json (abort without writing)
+        settings_path4 = os.path.join(tmp_home, "settings_broken.json")
+        with open(settings_path4, "w", encoding="utf-8") as f:
+            f.write('{"broken": true,}')  # trailing comma — invalid JSON
+        ok5, msg5 = install_statusline_hook(settings_path4, fake_script)
+        assert not ok5, "should have failed on malformed JSON"
+        # File must be unchanged (still unparseable, not overwritten)
+        with open(settings_path4, encoding="utf-8") as f:
+            raw = f.read()
+        assert "broken" in raw and raw.strip().endswith("}") is False or "}" in raw
+        print("hook install — malformed JSON aborted cleanly: OK")
+
         # --- taskbar tray-rect detection: must degrade gracefully off-Windows ---
         if not sys.platform.startswith("win"):
             assert find_tray_notification_rect() is None
             print("find_tray_notification_rect() correctly returns None off-Windows: OK")
+
+        # --- Windows startup registration: pure command-string logic ---
+        # Pure path/string logic -- runs on any OS, no registry involved.
+        cmd = build_startup_command(
+            frozen=True, executable=r"C:\Apps\ClaudeUsageTray.exe",
+            script_path=r"C:\Apps\claude_usage_tray.py",
+        )
+        assert cmd == '"C:\\Apps\\ClaudeUsageTray.exe"', cmd
+
+        cmd = build_startup_command(
+            frozen=False, executable=r"C:\Python312\python.exe",
+            script_path=r"C:\code\claude_usage_tray.py",
+        )
+        # no real pythonw.exe on disk at that fabricated path -> falls back to executable
+        assert cmd == '"C:\\Python312\\python.exe" "C:\\code\\claude_usage_tray.py"', cmd
+        print("build_startup_command (frozen / non-frozen, no pythonw present): OK")
+
+        # pythonw.exe preference: create a *real* file in the tmp sandbox so
+        # os.path.isfile() finds it, without touching any real Python install.
+        fake_pyw = os.path.join(tmp_home, "pythonw.exe")
+        with open(fake_pyw, "w", encoding="utf-8"):
+            pass
+        fake_py = os.path.join(tmp_home, "python.exe")
+        cmd = build_startup_command(
+            frozen=False, executable=fake_py, script_path=r"C:\code\claude_usage_tray.py",
+        )
+        assert cmd == f'"{fake_pyw}" "C:\\code\\claude_usage_tray.py"', cmd
+        print("build_startup_command prefers pythonw.exe when present alongside python.exe: OK")
+
+        # --- Windows startup registration: real registry round-trip (Windows only) ---
+        # Always uses a disposable test subkey, never STARTUP_RUN_SUBKEY (the real
+        # HKCU\...\CurrentVersion\Run) -- this must never register the test run itself.
+        if sys.platform.startswith("win"):
+            try:
+                import winreg
+                test_subkey = r"Software\ClaudeUsageTrayTestOnly_DoNotUseForRealStartup"
+                test_value_name = "ClaudeUsageTrayTest"
+                try:
+                    assert is_startup_enabled(test_value_name, test_subkey) is False
+
+                    ok = set_startup_enabled(
+                        True, value_name=test_value_name, subkey=test_subkey,
+                        frozen=True, executable=r"C:\fake\test.exe", script_path=r"C:\fake\test.py",
+                    )
+                    assert ok is True
+                    assert is_startup_enabled(test_value_name, test_subkey) is True
+
+                    ok = set_startup_enabled(
+                        False, value_name=test_value_name, subkey=test_subkey,
+                    )
+                    assert ok is True
+                    assert is_startup_enabled(test_value_name, test_subkey) is False
+                    print("Windows startup registry read/write/delete (disposable test subkey): OK")
+                finally:
+                    try:
+                        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, test_subkey)
+                    except OSError:
+                        pass
+            except ImportError:
+                print("winreg not available — skipping Windows startup registry test")
+        else:
+            assert is_startup_enabled() is False
+            assert set_startup_enabled(True) is False
+            print("Windows startup registration degrades gracefully off-Windows: OK")
+
+        # --- z-order position algorithm ---
+        # _zorder_position walks a top→bottom HWND chain and reports our position
+        # relative to the taskbar.  Tests use fake integer HWNDs.
+        OUR, TB, OTHER1, OTHER2 = 100, 200, 300, 400
+
+        assert _zorder_position([OUR, OTHER1, TB], OUR, TB) == "above"
+        assert _zorder_position([OTHER1, TB, OUR], OUR, TB) == "below"
+        assert _zorder_position([OTHER1, OUR, TB, OTHER2], OUR, TB) == "above"
+        # taskbar found but our HWND never appeared before it → we are below
+        assert _zorder_position([OTHER1, OTHER2, TB], OUR, TB) == "below"
+        # taskbar absent from chain entirely → cannot determine position
+        assert _zorder_position([OUR, OTHER1, OTHER2], OUR, TB) == "unknown"
+        assert _zorder_position([], OUR, TB) == "unknown"                     # empty chain
+        assert _zorder_position([TB, OUR], OUR, TB) == "below"                # taskbar first
+        assert _zorder_position([OUR, TB], OUR, TB) == "above"                # adjacent
+        print("z-order position algorithm: OK")
+
+        # --- overlay machinery regression guards ---
+        # Each test here encodes a specific bug that was introduced during development
+        # and cost significant debugging time.  If the fix is ever accidentally reverted,
+        # the test name and message say exactly what broke and why.
+        import re
+
+        with open(__file__, encoding="utf-8") as _f:
+            _src = _f.read()
+
+        def _method_body(name):
+            """Extract the body of a method named `name` from the source, stripping docstrings."""
+            m = re.search(
+                rf"def {re.escape(name)}\(self\):(.*?)(?=\n        def |\Z)",
+                _src, re.DOTALL,
+            )
+            assert m, f"{name} not found in source"
+            return re.sub(r'""".*?"""', "", m.group(1), flags=re.DOTALL)
+
+        # Guard 1: _reassert_topmost must use root.attributes(), not ctypes SetWindowPos.
+        #
+        # Background: Tk's WndProc intercepts WM_WINDOWPOSCHANGING and silently reverts
+        # any HWND_TOPMOST promotion that did not originate from Tk's own machinery
+        # (it checks wmPtr->flags and cancels external SetWindowPos(-1) calls).
+        # Using root.attributes("-topmost") goes through Tk's own path, so it sticks.
+        _rt = _method_body("_reassert_topmost")
+        assert 'attributes("-topmost", False)' in _rt, \
+            "REGRESSION: _reassert_topmost must call root.attributes('-topmost', False) first"
+        assert 'attributes("-topmost", True)' in _rt, \
+            "REGRESSION: _reassert_topmost must call root.attributes('-topmost', True)"
+        assert _rt.index('attributes("-topmost", False)') < _rt.index('attributes("-topmost", True)'), \
+            "REGRESSION: _reassert_topmost must set False (NOTOPMOST) before True (TOPMOST); " \
+            "SetWindowPos(HWND_TOPMOST) on an already-topmost window is a z-order no-op"
+        assert "windll.user32.SetWindowPos" not in _rt, \
+            "REGRESSION: _reassert_topmost must not call ctypes.SetWindowPos directly — " \
+            "Tk's WndProc vetoes it, leaving TOPMOST=False every time"
+        print("_reassert_topmost uses root.attributes (not ctypes SetWindowPos): OK")
+
+        # Guard 2: _apply_overlay_styles must NOT call root.attributes("-topmost") synchronously.
+        #
+        # Background: calling root.attributes("-topmost", True) inside _apply_overlay_styles()
+        # triggers Tk's SetWindowPos internally while the geometry from _place_initial() is
+        # still queued.  The synchronous Win32 message processing during that SetWindowPos
+        # cancels the pending window move, leaving the widget stuck at (0, 0) permanently.
+        _ao = _method_body("_apply_overlay_styles")
+        # Strip comment-only lines before scanning for attribute calls (comments
+        # in the method body may legitimately mention the attribute by name)
+        _ao_code = "\n".join(
+            ln for ln in _ao.splitlines() if not ln.lstrip().startswith("#")
+        )
+        direct_topmost = [c for c in re.findall(r'.{0,60}attributes\("-topmost"', _ao_code)
+                          if "after(" not in c]
+        assert not direct_topmost, \
+            "REGRESSION: _apply_overlay_styles must not call root.attributes('-topmost') " \
+            "synchronously — it cancels the pending geometry from _place_initial(), " \
+            f"locking the widget at (0,0). Found: {direct_topmost}"
+        print("_apply_overlay_styles has no synchronous root.attributes(-topmost) call: OK")
+
+        # Guard 3: FloatingWidget.__init__ must flush geometry to Win32 between
+        # _place_initial() and _apply_overlay_styles().
+        #
+        # Background: root.geometry() queues the window move but does not immediately
+        # call SetWindowPos.  Without update_idletasks() to flush the queue first,
+        # the Win32 message processing inside _apply_overlay_styles() (specifically
+        # SetWindowLongW posting WM_STYLECHANGED) cancels the queued move.
+        # Result: the widget is positioned correctly in Tk's internal state but sits
+        # at (0, 0) in Win32 / GetWindowRect — permanently.
+        #
+        # We scan the source text directly between the two call sites rather than
+        # trying to extract __init__'s body via regex (the file has multiple nested
+        # __init__ definitions at the same indentation level which confuse the extractor).
+        _pi_src = _src.find("self._place_initial()")
+        _ao_src = _src.find("self._apply_overlay_styles()")
+        assert 0 < _pi_src < _ao_src, \
+            "_place_initial() must appear before _apply_overlay_styles() in source"
+        _between_calls = _src[_pi_src:_ao_src]
+        assert "update_idletasks()" in _between_calls, \
+            "REGRESSION: __init__ must call update_idletasks() between _place_initial() " \
+            "and _apply_overlay_styles() — without it, the pending geometry move is " \
+            "cancelled by Win32 message processing during style setup, leaving widget at (0,0)"
+        print("__init__ flushes geometry before _apply_overlay_styles: OK")
+
+        # --- favorite-position feature: cross-thread-safety guards ---
+        # Unlike Guards 1-3 above, these don't encode a bug that actually
+        # happened here — they encode CLAUDE.md's "no cross-thread Tkinter
+        # calls" rule preemptively for this new feature, so a future refactor
+        # can't casually reintroduce a tray-thread call into widget.root.
+
+        def _handler_body(name):
+            """Extract the body of a 4-space-indented on_* tray handler
+            (signature `(icon, item)`) from the source, stripping docstrings
+            and comment-only lines."""
+            m = re.search(
+                rf"\n    def {re.escape(name)}\(icon, item\):(.*?)(?=\n    def |\Z)",
+                _src, re.DOTALL,
+            )
+            assert m, f"{name} not found in source"
+            body = re.sub(r'""".*?"""', "", m.group(1), flags=re.DOTALL)
+            return "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+
+        # Guard 4: on_save_favorite (tray thread) must read the position mirror,
+        # never touch Tkinter directly.
+        _osf = _handler_body("on_save_favorite")
+        for _forbidden in ("winfo_x", "winfo_y", ".geometry(", "widget.root"):
+            assert _forbidden not in _osf, (
+                f"REGRESSION: on_save_favorite (tray thread) must not call {_forbidden!r} "
+                "directly -- read widget.last_known_pos (a plain tuple mirrored by the Tk "
+                "thread's _tick()/_end_drag()) instead."
+            )
+        assert "last_known_pos" in _osf, (
+            "REGRESSION: on_save_favorite must read widget.last_known_pos, not "
+            "recompute the position itself"
+        )
+        print("on_save_favorite does not touch Tkinter directly: OK")
+
+        # Guard 5: on_load_favorite must only signal an Event.
+        _olf = _handler_body("on_load_favorite")
+        for _forbidden in ("winfo_x", "winfo_y", ".geometry(", "widget.root"):
+            assert _forbidden not in _olf, (
+                f"REGRESSION: on_load_favorite (tray thread) must not call {_forbidden!r} "
+                "directly -- it must only set load_favorite_requested and let the Tk "
+                "thread's _tick() apply the geometry change itself."
+            )
+        assert "load_favorite_requested.set()" in _olf, (
+            "REGRESSION: on_load_favorite must signal the Tk thread via "
+            "load_favorite_requested.set(), not move the window itself"
+        )
+        print("on_load_favorite only signals an Event, never touches Tkinter: OK")
+
+        # Guard 6: the Tk-side application of a loaded favorite must happen
+        # inside _tick() (or a method _tick() calls), never inside an on_* handler.
+        _tick_body = _method_body("_tick")
+        assert "_apply_favorite_position()" in _tick_body, (
+            "REGRESSION: _tick() must call self._apply_favorite_position() -- this "
+            "is the only place load_favorite_requested may be consumed and applied"
+        )
+        _afp = _method_body("_apply_favorite_position")
+        assert ".geometry(" in _afp, (
+            "_apply_favorite_position must actually call self.root.geometry(...) -- "
+            "this is the one and only place a favorite-position load may touch Tkinter"
+        )
+        print("_apply_favorite_position is Tk-thread-only, invoked from _tick(): OK")
+
+        # Guard 7: _apply_favorite_position must flush the queued geometry move
+        # with update_idletasks() before returning.
+        #
+        # Background: _tick() calls _reassert_topmost() (root.attributes(
+        # "-topmost", ...), a synchronous SetWindowPos) immediately after
+        # _apply_favorite_position() returns, within the same tick. Without
+        # flushing first, that call wins the race and silently drops the
+        # pending geometry() move -- confirmed on real Windows hardware: the
+        # favorite position saved correctly but "Load favorite position"
+        # visibly did nothing. Same underlying class of bug as the
+        # _place_initial()/_apply_overlay_styles() ordering fix above.
+        assert _afp.index(".geometry(") < _afp.index("update_idletasks()"), (
+            "REGRESSION: _apply_favorite_position must call update_idletasks() "
+            "right after self.root.geometry(...) -- otherwise _reassert_topmost(), "
+            "called next in the same _tick() invocation, can cancel the pending move"
+        )
+        print("_apply_favorite_position flushes geometry before returning: OK")
 
         print("\nALL TESTS PASSED")
     finally:
@@ -978,11 +2289,18 @@ if __name__ == "__main__":
         help="read a Claude Code statusLine JSON payload from stdin, cache the "
              "rate-limit fields, and print a status line back (see README.md)",
     )
+    cli.add_argument(
+        "--install-hook", action="store_true",
+        help="add the statusLine hook entry to ~/.claude/settings.json so Claude "
+             "Code starts piping rate-limit data to this script automatically",
+    )
     args = cli.parse_args()
 
     if args.test:
         run_tests()
     elif args.statusline_hook:
         run_statusline_hook()
+    elif args.install_hook:
+        run_install_hook()
     else:
         run_app()

@@ -1,7 +1,4 @@
 pystray>=0.19.5
 Pillow>=10.0.0
 watchdog>=4.0.0
-# Optional: only used for precisely placing the floating widget next to
-# the real taskbar tray icons on first run. Without it, a reasonable
-# screen-corner estimate is used instead -- everything else still works.
-pywin32>=306; sys_platform == 'win32'
+# pywin32 is no longer required: taskbar detection now uses ctypes (stdlib).

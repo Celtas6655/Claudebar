@@ -54,10 +54,14 @@ exposed only through the statusLine payload. See ARCHITECTURE.md §2.
   `Pillow`, or `tkinter` imports at module level — only inside
   `run_app()`). It must also never touch the real `~/.claude` directory;
   always use temp dirs / explicit path params in tests.
-- The PyInstaller `.exe` build is `--noconsole` (for the tray icon) and
-  **cannot** be used for `--statusline-hook` — that needs real
-  stdin/stdout, use plain `python claude_usage_tray.py
-  --statusline-hook` for the hook regardless of whether an `.exe` exists.
+- The single PyInstaller `--noconsole` `.exe` handles every mode,
+  **including `--statusline-hook`** — but only because the hook path
+  reads/writes fds 0/1 directly (`_read_hook_stdin`/`_write_hook_stdout`),
+  since a windowed build has `sys.stdin`/`sys.stdout == None`. Don't
+  "simplify" the hook back to `json.load(sys.stdin)`/`print()` — that
+  silently breaks the frozen exe. Test the hook with `cmd` redirection
+  (`exe < in.txt > out.txt`), never a PowerShell pipe (which doesn't
+  capture a GUI-subsystem exe's stdout).
 - No cross-thread Tkinter calls. Use a `threading.Event` set elsewhere
   and polled from inside the Tk thread's own `after()` loop — see
   ARCHITECTURE.md §5 for the existing pattern (`widget_visible`,

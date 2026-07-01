@@ -66,6 +66,17 @@ PROJECTS_DIR = os.path.join(CLAUDE_HOME, "projects")
 # numbers it receives from Claude Code, for the tray app to read.
 USAGE_CACHE_PATH = os.path.join(CLAUDE_HOME, "usage_tray_cache.json")
 
+# Our own marker recording that we've wired the statusLine hook into Claude
+# Code's settings.json (see ensure_hook_installed). Deliberately a separate
+# sidecar, NOT a key inside settings.json -- that file's parse is strict and
+# fragile (one stray key/comment breaks all of it), so we never write anything
+# but the `statusLine` entry into it.
+HOOK_INSTALLED_MARKER_PATH = os.path.join(CLAUDE_HOME, "usage_tray_hook_installed.json")
+
+# App version -- single source of truth, mirrored by the VERSION file at the
+# repo root that the release workflow reads to tag the build.
+__version__ = "1.0.0"
+
 # Approximate USD price per 1M tokens: (input, output, cache_write, cache_read)
 # Anthropic's published per-model rates as of mid-2026 -- treat as a rough
 # estimate and check https://platform.claude.com/docs/en/about-claude/pricing
@@ -727,6 +738,24 @@ def build_startup_command(frozen, executable, script_path):
     return f'"{interpreter}" "{script_path}"'
 
 
+def build_hook_command(frozen, executable, script_path):
+    """Pure: decide the statusLine command line to register in Claude Code's
+    settings.json.
+
+    frozen/executable/script_path are explicit (not read from sys.*) so this
+    is unit-testable on any OS without a real frozen build.
+
+    - frozen=True  -> the exe itself plus --statusline-hook. Uses the console
+      subsystem's raw fds at runtime (see _read_hook_stdin), so a windowed
+      build still works as the hook.
+    - frozen=False -> the running interpreter + this script + --statusline-hook
+      (the plain `python claude_usage_tray.py --statusline-hook` form).
+    """
+    if frozen:
+        return f'"{executable}" --statusline-hook'
+    return f'"{executable}" "{script_path}" --statusline-hook'
+
+
 def _startup_registry_read(value_name, subkey=None, hive=None):
     """Read a REG_SZ value from the given registry subkey.
 
@@ -883,14 +912,20 @@ def read_usage_cache(cache_path=None):
         return None
 
 
-def install_statusline_hook(settings_path, script_path):
+def install_statusline_hook(settings_path, command, force=True):
     """Merge the statusLine hook entry into Claude Code's settings.json.
 
-    Returns (success: bool, message: str).
-    Never touches the file if it can't be parsed cleanly — safer than
-    risking a corrupt settings.json (one stray comma kills the whole file).
+    `command` is the fully-formed command line (see build_hook_command).
+
+    force=True  -> always (re)write our entry, even over a different existing
+                   statusLine command (the --install-hook escape hatch).
+    force=False -> only add our entry when there's NO statusLine at all; never
+                   clobber a user's own/foreign statusLine (the auto path).
+
+    Returns (success: bool, message: str). Never touches the file if it can't
+    be parsed cleanly — safer than risking a corrupt settings.json (one stray
+    comma kills the whole file).
     """
-    command = "python " + script_path.replace("\\", "/") + " --statusline-hook"
     desired = {"type": "command", "command": command}
 
     # Read existing settings (or start fresh if the file doesn't exist yet)
@@ -910,6 +945,13 @@ def install_statusline_hook(settings_path, script_path):
     existing = settings.get("statusLine")
     if existing == desired:
         return True, "statusLine hook already configured — nothing to change."
+
+    if existing is not None and not force:
+        return True, (
+            "Left the existing statusLine untouched:\n"
+            f"  {json.dumps(existing)}\n"
+            "Run with --install-hook to overwrite it with this app's hook."
+        )
 
     if existing is not None:
         msg_prefix = f"Replacing existing statusLine:\n  {json.dumps(existing)}\nwith:"
@@ -935,29 +977,138 @@ def install_statusline_hook(settings_path, script_path):
     )
 
 
+def _current_statusline_command(settings_path):
+    """The `statusLine.command` string currently in settings.json, or None."""
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    sl = settings.get("statusLine")
+    return sl.get("command") if isinstance(sl, dict) else None
+
+
+def write_hook_marker(command, marker_path=None):
+    """Record that our statusLine hook is in place. Atomic, fail-soft."""
+    marker_path = marker_path or HOOK_INSTALLED_MARKER_PATH
+    write_usage_cache({"installed": True, "command": command}, cache_path=marker_path)
+
+
+def read_hook_marker(marker_path=None):
+    """Read the hook-installed marker sidecar, or None if absent/unreadable."""
+    marker_path = marker_path or HOOK_INSTALLED_MARKER_PATH
+    return read_usage_cache(cache_path=marker_path)
+
+
+def ensure_hook_installed(settings_path, command, marker_path, force=False):
+    """Make sure Claude Code's statusLine points at our hook, and record a
+    marker sidecar when it does.
+
+    force=False (auto, called on every app startup): install only if there's
+      no statusLine yet, so a fresh run — or a run after the user deleted the
+      setting — wires it up automatically, while a user's own statusLine is
+      left alone. Idempotent when ours is already configured.
+    force=True (--install-hook): always (re)write ours.
+
+    Returns (success, message). Fail-soft; never raises.
+    """
+    success, message = install_statusline_hook(settings_path, command, force=force)
+    if success and _current_statusline_command(settings_path) == command:
+        write_hook_marker(command, marker_path)
+    return success, message
+
+
+def _resolve_hook_command():
+    """The statusLine command line for the current process (frozen exe or
+    plain python), via build_hook_command."""
+    frozen = getattr(sys, "frozen", False)
+    return build_hook_command(frozen, sys.executable, os.path.abspath(__file__))
+
+
 def run_install_hook():
-    """Entry point for --install-hook: wires this script into Claude Code's
-    settings.json as the statusLine command."""
+    """Entry point for --install-hook: force-(re)writes this app as Claude
+    Code's statusLine command, overwriting any existing one."""
     settings_path = os.path.join(CLAUDE_HOME, "settings.json")
-    script_path = os.path.abspath(__file__)
-    success, message = install_statusline_hook(settings_path, script_path)
-    print(message)
+    success, message = ensure_hook_installed(
+        settings_path, _resolve_hook_command(), HOOK_INSTALLED_MARKER_PATH, force=True,
+    )
+    # Use the fd-safe writer, not print(): a windowed (--noconsole) exe has
+    # sys.stdout == None, which would make print() raise after the install.
+    _write_hook_stdout(message)
     if not success:
         sys.exit(1)
 
 
-def run_statusline_hook():
-    """Entry point for `python claude_usage_tray.py --statusline-hook`,
-    meant to be wired up as Claude Code's `statusLine` command (see
-    README.md). Reads Claude Code's JSON payload from stdin, caches it,
-    and prints a compact status line back to stdout."""
+def _read_hook_stdin():
+    """Read the raw statusLine payload bytes from standard input.
+
+    A PyInstaller ``--noconsole`` (GUI-subsystem) build sets ``sys.stdin``
+    to ``None`` because there's no console -- but Claude Code invokes the
+    statusLine command with stdin *redirected* to a pipe, so the raw OS
+    file descriptor 0 is still valid. So prefer ``sys.stdin`` when it
+    exists (plain ``python`` invocation), and fall back to reading fd 0
+    directly (frozen exe). Fails soft to empty bytes.
+    """
+    stream = getattr(sys, "stdin", None)
+    if stream is not None:
+        try:
+            return stream.buffer.read()
+        except (AttributeError, ValueError, OSError):
+            try:
+                return stream.read().encode("utf-8", "replace")
+            except (ValueError, OSError):
+                return b""
+    # No sys.stdin (windowed frozen build): read the redirected fd 0 directly.
     try:
-        payload = json.load(sys.stdin)
+        chunks = []
+        while True:
+            chunk = os.read(0, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError:
+        return b""
+
+
+def _write_hook_stdout(text):
+    """Write the status line back to standard output.
+
+    Mirror of _read_hook_stdin: ``sys.stdout`` is ``None`` in a windowed
+    frozen build, but fd 1 is a valid redirected pipe when Claude Code
+    captures the status line. Fails soft.
+    """
+    data = (text + "\n").encode("utf-8", "replace")
+    stream = getattr(sys, "stdout", None)
+    if stream is not None:
+        try:
+            stream.buffer.write(data)
+            stream.flush()
+            return
+        except (AttributeError, ValueError, OSError):
+            pass
+    try:
+        os.write(1, data)
+    except OSError:
+        pass
+
+
+def run_statusline_hook():
+    """Entry point for `... --statusline-hook`, meant to be wired up as
+    Claude Code's `statusLine` command (see README.md). Reads Claude Code's
+    JSON payload from stdin, caches it, and prints a compact status line
+    back to stdout.
+
+    Reads/writes stdin/stdout via raw OS file descriptors when needed so
+    this works from a windowed (``--noconsole``) PyInstaller exe, where
+    ``sys.stdin``/``sys.stdout`` are ``None`` -- see _read_hook_stdin."""
+    try:
+        payload = json.loads(_read_hook_stdin().decode("utf-8", "replace"))
     except (json.JSONDecodeError, ValueError):
         payload = {}
     cache, status_line_text = process_statusline_payload(payload)
     write_usage_cache(cache)
-    print(status_line_text)
+    _write_hook_stdout(status_line_text)
 
 
 # --------------------------------------------------------------------------
@@ -972,6 +1123,18 @@ def run_app():
     from PIL import Image, ImageDraw
     from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
+
+    # Zero-setup: on every launch, make sure Claude Code is piping rate-limit
+    # data to us. Only adds our statusLine when none exists (so a fresh install,
+    # or a rerun after the user deleted the setting, self-heals); never clobbers
+    # a user's own statusLine. Fully fail-soft — must never block the tray.
+    try:
+        ensure_hook_installed(
+            os.path.join(CLAUDE_HOME, "settings.json"),
+            _resolve_hook_command(), HOOK_INSTALLED_MARKER_PATH, force=False,
+        )
+    except Exception:
+        pass
 
     FALLBACK_SWEEP_SECONDS = 30   # safety-net full rescan interval
     WATCHER_RETRY_SECONDS = 5     # retry interval if projects dir doesn't exist yet
@@ -1973,14 +2136,24 @@ def run_tests():
         assert pct_tag(None) == "dim"
         print("Widget color-threshold helper: OK")
 
+        # --- statusLine hook command construction (pure, frozen-aware) ---
+        exe = r"C:\Apps\ClaudeUsageTray.exe"
+        script = r"C:\code\claude_usage_tray.py"
+        frozen_cmd = build_hook_command(True, exe, script)
+        assert frozen_cmd == f'"{exe}" --statusline-hook', frozen_cmd
+        py = r"C:\Python312\python.exe"
+        nonfrozen_cmd = build_hook_command(False, py, script)
+        assert nonfrozen_cmd == f'"{py}" "{script}" --statusline-hook', nonfrozen_cmd
+        assert "python" not in frozen_cmd.lower()  # frozen exe never invokes python
+        print("build_hook_command (frozen exe vs. python script): OK")
+
         # --- statusLine hook installation ---
-        fake_script = "/path/to/claude_usage_tray.py"
-        expected_cmd = f"python {fake_script} --statusline-hook"
+        expected_cmd = build_hook_command(False, "python", "/path/to/claude_usage_tray.py")
         expected_block = {"type": "command", "command": expected_cmd}
 
         # Case 1: fresh install (no settings.json)
         settings_path = os.path.join(tmp_home, "settings_fresh.json")
-        ok, msg = install_statusline_hook(settings_path, fake_script)
+        ok, msg = install_statusline_hook(settings_path, expected_cmd)
         assert ok, msg
         with open(settings_path, encoding="utf-8") as f:
             data = json.load(f)
@@ -1991,7 +2164,7 @@ def run_tests():
         settings_path2 = os.path.join(tmp_home, "settings_merge.json")
         with open(settings_path2, "w", encoding="utf-8") as f:
             json.dump({"theme": "dark", "autoUpdates": False}, f)
-        ok, msg = install_statusline_hook(settings_path2, fake_script)
+        ok, msg = install_statusline_hook(settings_path2, expected_cmd)
         assert ok, msg
         with open(settings_path2, encoding="utf-8") as f:
             data2 = json.load(f)
@@ -2001,34 +2174,85 @@ def run_tests():
         print("hook install — merges with existing keys: OK")
 
         # Case 3: already configured with the same command (no-op)
-        ok3, msg3 = install_statusline_hook(settings_path2, fake_script)
+        ok3, msg3 = install_statusline_hook(settings_path2, expected_cmd)
         assert ok3, msg3
         assert "already" in msg3.lower()
         print("hook install — already configured, no-op: OK")
 
-        # Case 4: existing statusLine with a different command (overwritten)
+        # Case 4: existing statusLine with a different command (force overwrites)
         settings_path3 = os.path.join(tmp_home, "settings_overwrite.json")
         with open(settings_path3, "w", encoding="utf-8") as f:
             json.dump({"statusLine": {"type": "command", "command": "old-cmd"}}, f)
-        ok4, msg4 = install_statusline_hook(settings_path3, fake_script)
+        ok4, msg4 = install_statusline_hook(settings_path3, expected_cmd, force=True)
         assert ok4, msg4
         with open(settings_path3, encoding="utf-8") as f:
             data3 = json.load(f)
         assert data3["statusLine"] == expected_block
         assert "old-cmd" in msg4  # message must mention the old value
-        print("hook install — overwrites different command: OK")
+        print("hook install — force overwrites different command: OK")
+
+        # Case 4b: force=False must NOT clobber a foreign statusLine
+        settings_path3b = os.path.join(tmp_home, "settings_foreign.json")
+        foreign = {"statusLine": {"type": "command", "command": "someone-elses-cmd"}}
+        with open(settings_path3b, "w", encoding="utf-8") as f:
+            json.dump(foreign, f)
+        ok4b, msg4b = install_statusline_hook(settings_path3b, expected_cmd, force=False)
+        assert ok4b, msg4b
+        with open(settings_path3b, encoding="utf-8") as f:
+            data3b = json.load(f)
+        assert data3b["statusLine"]["command"] == "someone-elses-cmd", data3b
+        print("hook install — force=False leaves a foreign statusLine untouched: OK")
 
         # Case 5: malformed settings.json (abort without writing)
         settings_path4 = os.path.join(tmp_home, "settings_broken.json")
         with open(settings_path4, "w", encoding="utf-8") as f:
             f.write('{"broken": true,}')  # trailing comma — invalid JSON
-        ok5, msg5 = install_statusline_hook(settings_path4, fake_script)
+        ok5, msg5 = install_statusline_hook(settings_path4, expected_cmd)
         assert not ok5, "should have failed on malformed JSON"
         # File must be unchanged (still unparseable, not overwritten)
         with open(settings_path4, encoding="utf-8") as f:
             raw = f.read()
         assert "broken" in raw and raw.strip().endswith("}") is False or "}" in raw
         print("hook install — malformed JSON aborted cleanly: OK")
+
+        # --- ensure_hook_installed: auto (force=False) vs. force, plus marker ---
+        auto_settings = os.path.join(tmp_home, "settings_auto.json")
+        auto_marker = os.path.join(tmp_home, "hook_marker.json")
+        # (a) fresh: no statusLine -> installs ours + writes the marker
+        okA, _ = ensure_hook_installed(auto_settings, expected_cmd, auto_marker, force=False)
+        assert okA
+        assert _current_statusline_command(auto_settings) == expected_cmd
+        marker = read_hook_marker(marker_path=auto_marker)
+        assert marker and marker.get("installed") is True
+        assert marker.get("command") == expected_cmd
+        print("ensure_hook_installed — auto install on empty settings + marker: OK")
+        # (b) idempotent: running again changes nothing, marker still ours
+        okB, _ = ensure_hook_installed(auto_settings, expected_cmd, auto_marker, force=False)
+        assert okB and _current_statusline_command(auto_settings) == expected_cmd
+        print("ensure_hook_installed — idempotent when already ours: OK")
+        # (c) foreign statusLine: auto path must NOT write our marker or clobber
+        foreign_settings = os.path.join(tmp_home, "settings_auto_foreign.json")
+        foreign_marker = os.path.join(tmp_home, "hook_marker_foreign.json")
+        with open(foreign_settings, "w", encoding="utf-8") as f:
+            json.dump({"statusLine": {"type": "command", "command": "mine"}}, f)
+        okC, _ = ensure_hook_installed(foreign_settings, expected_cmd, foreign_marker, force=False)
+        assert okC and _current_statusline_command(foreign_settings) == "mine"
+        assert read_hook_marker(marker_path=foreign_marker) is None
+        print("ensure_hook_installed — foreign statusLine left intact, no marker: OK")
+        # (d) force: overwrites the foreign command and now writes our marker
+        okD, _ = ensure_hook_installed(foreign_settings, expected_cmd, foreign_marker, force=True)
+        assert okD and _current_statusline_command(foreign_settings) == expected_cmd
+        assert read_hook_marker(marker_path=foreign_marker).get("command") == expected_cmd
+        print("ensure_hook_installed — force overwrites foreign + writes marker: OK")
+
+        # --- statusLine hook stdin/stdout round-trip (raw-fd path fallback) ---
+        _hook_payload = json.dumps(
+            {"model": {"display_name": "hooktest"},
+             "rate_limits": {"five_hour": {"used_percentage": 50, "resets_at": 1782500000}}}
+        )
+        _hcache, _hline = process_statusline_payload(json.loads(_hook_payload))
+        assert "hooktest" in _hline and "5h 50%" in _hline, _hline
+        print("statusline payload -> status line text: OK")
 
         # --- taskbar tray-rect detection: must degrade gracefully off-Windows ---
         if not sys.platform.startswith("win"):

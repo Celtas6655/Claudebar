@@ -406,7 +406,8 @@ Everything this app reads or writes, and why:
 | `~/.claude/usage_tray_cache.json` | `--statusline-hook` mode | tray menu, floating widget | Session (5h) %, weekly (7d) %, context-window %, reset timestamps. Atomic write (temp file + `os.replace`). |
 | `~/.claude/usage_tray_widget_pos.json` | `FloatingWidget._end_drag()` | `FloatingWidget._default_position()` | Remembers where the user dragged the widget, so the taskbar-detection heuristic only applies once, ever. |
 | `~/.claude/usage_tray_widget_favorite_pos.json` | tray menu's "Save current position as favorite" (`on_save_favorite`, via `widget.last_known_pos`) | `FloatingWidget._apply_favorite_position()`; "Load favorite position" menu item's `enabled=` check | User-designated single favorite screen position, independent of the last-dragged position (`usage_tray_widget_pos.json`). Same atomic-write shape. |
-| `~/.claude/settings.json` | the user, manually | Claude Code itself | Where `statusLine.command` is wired to point at `python ... --statusline-hook`. Not managed by this app — just documented. |
+| `~/.claude/settings.json` | the user, or this app's auto-install (`ensure_hook_installed`, only when no `statusLine` exists), or `--install-hook` (force) | Claude Code itself | Where `statusLine.command` is wired to point at the hook. On startup the app adds this entry itself if absent; it never clobbers a user's own `statusLine` unless `--install-hook` is used. Only ever writes the `statusLine` key — nothing else (a stray key would break the file's strict parse, §10). |
+| `~/.claude/usage_tray_hook_installed.json` | `write_hook_marker` (via `ensure_hook_installed`) | tray menu indicator; `ensure_hook_installed` (avoid redundant writes) | Marker recording that *we* installed the statusLine hook, and the command we wrote. Deliberately a separate sidecar, NOT a key in `settings.json`. Same atomic-write shape. |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`ClaudeUsageTray` value) | tray menu's "Run on Windows startup" toggle (`on_toggle_startup` → `set_startup_enabled`) | Windows itself, at login | Per-user autostart registration. Not a file, but the same "external state this app manages" category — added/removed via `winreg`, no admin rights needed (HKCU, not HKLM). |
 
 ## 9. Known limitations and things explicitly not verified
@@ -425,14 +426,21 @@ advance:
   is a relatively recent addition. Older Claude Code installs simply
   never send that field — there is no local fallback or workaround;
   the fix is "update Claude Code," not "fix this script."
-- **The PyInstaller `--noconsole`/windowed `.exe` build (used for the
-  tray icon so it doesn't pop a console window) cannot be reused for the
-  `--statusline-hook` invocation.** That build mode detaches
-  stdin/stdout, which breaks a tool that needs to read JSON from stdin
-  and print text back. The two modes of this one script have genuinely
-  different process requirements — keep using plain `python
-  claude_usage_tray.py --statusline-hook` for the hook, regardless of
-  whether a standalone `.exe` exists for the tray icon.
+- **The single windowed `.exe` handles every mode, including the hook —
+  but the hook path reads/writes raw file descriptors, not `sys.*`.** A
+  PyInstaller `--noconsole` (GUI-subsystem) build sets
+  `sys.stdin`/`sys.stdout` to `None` (no console), so the naive
+  `json.load(sys.stdin)` / `print()` would silently produce nothing. The
+  fix (see `_read_hook_stdin`/`_write_hook_stdout`) is to fall back to
+  `os.read(0, ...)` / `os.write(1, ...)`: when Claude Code invokes the
+  statusLine command it *redirects* stdin/stdout via pipes, so fds 0 and 1
+  stay valid regardless of subsystem. **Verified on real Windows**: the
+  built exe run as `dist\ClaudeUsageTray.exe --statusline-hook` with
+  cmd/Node-style handle redirection prints the status line and writes the
+  cache correctly. One caveat that bit during testing — a **PowerShell
+  pipe** (`... | exe`) does *not* capture a GUI-subsystem exe's stdout, so
+  test the hook with `cmd` file redirection (`exe < in.txt > out.txt`), not
+  `|`. This is also why the CI smoke-test step uses `shell: cmd`.
 - **The taskbar-tray-rect lookup (`find_tray_notification_rect`) was
   never run against a real Windows taskbar during development** — only
   designed defensively and confirmed to fall back gracefully off-Windows.

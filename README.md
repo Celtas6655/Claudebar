@@ -27,22 +27,30 @@ The floating widget is a borderless, always-on-top panel — just two compact ro
 its reset time next to it. The tray icon shows the same numbers on
 hover/right-click. *(Drop a real screenshot here once you have one.)*
 
-## Requirements
+## Install
+
+### Recommended: download the standalone `.exe` (no Python needed)
+
+1. Grab **`ClaudeUsageTray.exe`** from the
+   [latest release](https://github.com/Celtas6655/claudebar-usage/releases/latest).
+2. Double-click it. That's it — a tray icon and floating widget appear, and the
+   app **wires up the statusLine hook for you automatically** (it adds the entry
+   to `~/.claude/settings.json` only if you don't already have a `statusLine`).
+3. **Restart Claude Code once** so it starts sending session/weekly % data.
+
+One self-contained file handles everything — the tray app, the statusLine hook,
+and the auto-install. Nothing to install, no Python required. Put it wherever you
+like (and see [Run it automatically when Windows starts](#run-it-automatically-when-windows-starts)
+to launch it at login).
+
+### Alternative: run from source (needs Python)
 
 - **Windows** (the tray icon, floating-widget placement, and startup toggle are
   Windows-specific; `--test` and the statusLine hook run anywhere)
 - **Python 3.10+** — https://www.python.org/downloads/
-- Dependencies (installed via `requirements.txt`):
-  - `pystray` — system tray icon
-  - `Pillow` — draws the tray icon at runtime (no image file to ship)
-  - `watchdog` — filesystem watching for real-time updates
-  - `tkinter` — the floating widget; ships with the standard python.org
-    installer, no extra install
-
-> **Note:** `pywin32` is **not** required. First-run taskbar placement uses the
-> Windows API via `ctypes` from the standard library — nothing to install.
-
-## Quick start
+- Dependencies: `pystray`, `Pillow`, `watchdog`, and `tkinter` (the last ships
+  with the standard python.org installer). `pywin32` is **not** required —
+  first-run taskbar placement uses `ctypes` from the standard library.
 
 ```bash
 git clone https://github.com/Celtas6655/claudebar-usage.git
@@ -75,31 +83,39 @@ them is to have Claude Code hand them to you, via its `statusLine` hook.
 
 ### Setting up the statusLine hook (for session/weekly %)
 
-**Easy way — let the app wire it up for you:**
+**Automatic — nothing to do.** Just running the app (the `.exe` or the script)
+wires the hook up for you: on every launch it adds the `statusLine` entry to
+`~/.claude/settings.json` **if, and only if, you don't already have one**. It
+never overwrites a `statusLine` you set yourself. After the first time, just
+**restart Claude Code** so it picks up the change. (Deleted the entry and want it
+back? Just launch the app again.)
+
+**Force a rewrite** — if you want the app to overwrite an existing/foreign
+`statusLine` with its own hook:
 
 ```bash
-python claude_usage_tray.py --install-hook
+ClaudeUsageTray.exe --install-hook       # or: python claude_usage_tray.py --install-hook
 ```
 
-This merges the `statusLine` entry into `~/.claude/settings.json` for you
-(atomic write; it refuses to touch the file if it can't be parsed cleanly, so it
-won't corrupt an existing config). Then **restart Claude Code**.
+Either way the write is atomic and refuses to touch the file if it can't be
+parsed cleanly, so it won't corrupt an existing config. Then **restart Claude
+Code**.
 
 **Manual way** — open (or create) `~/.claude/settings.json` (on Windows:
-`%USERPROFILE%\.claude\settings.json`) and merge in:
+`%USERPROFILE%\.claude\settings.json`) and merge in one of:
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "python C:/full/path/to/claude_usage_tray.py --statusline-hook"
+    "command": "C:/full/path/to/ClaudeUsageTray.exe --statusline-hook"
   }
 }
 ```
 
-Use the full path to the script, with forward slashes (Windows accepts them in
-commands like this, and it avoids JSON backslash-escaping headaches). Restart
-Claude Code.
+…or, if running from source, `"python C:/full/path/to/claude_usage_tray.py
+--statusline-hook"`. Use forward slashes (Windows accepts them here, and it
+avoids JSON backslash-escaping headaches). Restart Claude Code.
 
 Either way: on your next turn, Claude Code starts piping its session data to the
 script, which caches the rate-limit numbers and prints a compact status line
@@ -107,11 +123,10 @@ script, which caches the rate-limit numbers and prints a compact status line
 terminal. The tray app and widget pick up that cache automatically — no restart
 of the app needed.
 
-> **Run the hook via plain `python ...`, not the bundled `.exe`.**
-> PyInstaller's windowed/`--noconsole` build (used for the tray icon so it
-> doesn't pop a console) detaches stdin/stdout, which breaks a tool that needs to
-> read JSON from stdin and print text back. The tray icon and the statusLine hook
-> are two different use cases for the same script.
+> **The bundled `.exe` runs the hook fine** — the single windowed executable
+> handles the tray app *and* the statusLine hook. (Internally the hook reads and
+> writes the raw stdin/stdout file descriptors, so it works even though a
+> windowed build has no console. Nothing you need to configure.)
 
 > **The `rate_limits` field is fairly recent** in Claude Code's statusLine
 > payload (Claude Code ≥ v1.2.80-ish). If after setup the tray still says
@@ -173,28 +188,33 @@ the percentage drawn centered inside each bar.
 > fails. If first-launch placement looks off, that's the part to flag. See
 > `ARCHITECTURE.md` for details.
 
-## Building a standalone .exe (no Python needed to run it afterwards)
+## Building the standalone .exe yourself
 
-Generate the icon once, then bundle with PyInstaller:
+Releases are built automatically by GitHub Actions
+([`.github/workflows/release.yml`](.github/workflows/release.yml)): every push to
+`master` builds the exe on a Windows runner, runs the test suite and a hook
+smoke-test as gates, and publishes a release tagged from the `VERSION` file. To
+cut a new version, bump `VERSION` and merge to `master`.
+
+To build one locally:
 
 ```bash
 pip install pyinstaller
 python generate_icon.py
-pyinstaller --onefile --noconsole --icon=icon.ico --name ClaudeUsageTray claude_usage_tray.py
+pyinstaller --onefile --noconsole --icon=icon.ico --name ClaudeUsageTray \
+    --collect-all pystray --collect-all watchdog claude_usage_tray.py
 ```
 
-The result is `dist/ClaudeUsageTray.exe` — self-contained; copy it wherever you
-like. The `--icon=icon.ico` flag stamps the app's actual usage-gauge icon onto
-the `.exe`; without it PyInstaller uses its own generic icon. (The tray icon
-itself is drawn by Pillow at runtime, but the `.exe`'s file/taskbar icon has to
-be baked in at build time, so it needs a real `.ico` on disk.)
+The result is `dist/ClaudeUsageTray.exe` — a single self-contained file that runs
+the tray app, the statusLine hook, and the auto-install, with no Python needed.
+The `--icon=icon.ico` flag stamps the app's usage-gauge icon onto the `.exe`
+(the tray icon itself is drawn by Pillow at runtime, but the file/taskbar icon is
+baked in at build time, so it needs a real `.ico` on disk).
 
-If you build often, wrap that `pyinstaller` line in a `build_exe.bat` of your
-own for convenience.
-
-> This `.exe` is for the tray icon only. Keep using
-> `python claude_usage_tray.py --statusline-hook` for the statusLine hook (see
-> above for why the windowed build can't do it).
+> Testing the hook on a freshly built exe: use `cmd` redirection
+> (`ClaudeUsageTray.exe --statusline-hook < payload.json > out.txt`), **not** a
+> PowerShell pipe — PowerShell doesn't capture a windowed exe's stdout, so a pipe
+> would look like it produced nothing even though it works.
 
 ## Run it automatically when Windows starts
 
@@ -244,9 +264,11 @@ latency.
 
 | File | What it is |
 |---|---|
-| `claude_usage_tray.py` | The entire app — tray, widget, tracker, statusLine hook, tests. Deliberately single-file. |
+| `claude_usage_tray.py` | The entire app — tray, widget, tracker, statusLine hook, hook auto-install, tests. Deliberately single-file. |
 | `generate_icon.py` | Generates `icon.ico` for the PyInstaller build. |
 | `requirements.txt` | Runtime dependencies. |
+| `VERSION` | Single source of truth for the release version; the workflow tags from it. |
+| `.github/workflows/release.yml` | Builds the exe on push to `master` and publishes a GitHub release. |
 | `ARCHITECTURE.md` | Deep design & decision history — the two data sources, threading model, two bug postmortems, what's verified vs. not. **Read this before any architectural change.** |
 | `CLAUDE.md` | Short index / guidance for AI agents working in this repo. |
 

@@ -851,6 +851,7 @@ def run_app():
     WIDGET_POS_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_pos.json")
     ALIGNMENT_CONFIG_PATH = os.path.join(CLAUDE_HOME, "usage_tray_alignment.json")
     WIDGET_PIN_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_pin.json")
+    WIDGET_FAVORITE_POS_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_favorite_pos.json")
 
     ALIGNMENT_CONFIG = TaskbarAlignmentConfig()
     _saved_align = read_usage_cache(cache_path=ALIGNMENT_CONFIG_PATH) or {}
@@ -868,6 +869,12 @@ def run_app():
     _saved_pin = read_usage_cache(cache_path=WIDGET_PIN_PATH) or {}
     if _saved_pin.get("pinned", False):
         position_pinned.set()
+    load_favorite_requested = threading.Event()
+    widget = None  # reassigned to the real FloatingWidget near the end of
+                   # run_app(); forward-declared so on_save_favorite/
+                   # on_load_favorite (tray thread, defined below) can
+                   # reference it as a free variable without a NameError if
+                   # clicked in the sub-second window before it's constructed.
 
     def current_snapshot():
         with state_lock:
@@ -972,6 +979,13 @@ def run_app():
             self.root.update_idletasks()    # ...so reqwidth/reqheight reflect it...
             self._place_initial()           # ...before sizing/positioning the window.
             self.root.update_idletasks()    # flush geometry to Win32 before style changes
+            # Mirrors the widget's current screen position into a plain tuple so
+            # a tray-thread callback (on_save_favorite) can read "where is the
+            # widget right now" without ever calling a Tkinter method itself.
+            # Only ever written from the Tk thread (here, in _tick(), and in
+            # _end_drag()) -- read cross-thread the same way ALIGNMENT_CONFIG.enabled
+            # already is.
+            self.last_known_pos = (self.root.winfo_x(), self.root.winfo_y())
             self._apply_overlay_styles()    # atomic Win32 layered-overlay setup
             self._set_transparent(True)
             self.root.after(150, self._fast_tick)
@@ -1167,6 +1181,38 @@ def run_app():
             x, y = self._compute_aligned_position(w, h, info)
             self.root.geometry(f"+{int(x)}+{int(y)}")
 
+        def _apply_favorite_position(self):
+            """Tk-thread-only, invoked from _tick() when load_favorite_requested
+            was set by on_load_favorite() (tray thread). Never call this, or
+            touch self.root, from an on_* tray callback directly -- see
+            ARCHITECTURE.md §5 on cross-thread Tkinter calls.
+
+            Disables taskbar alignment (same as a manual drag) so the 30s
+            re-align check in _tick() doesn't immediately undo the loaded
+            position, and persists the new position to WIDGET_POS_PATH so a
+            restart keeps the loaded favorite as the last-known position.
+            """
+            if position_pinned.is_set():
+                return
+            saved = read_usage_cache(cache_path=WIDGET_FAVORITE_POS_PATH)
+            if not saved or saved.get("x") is None or saved.get("y") is None:
+                return
+            x, y = int(saved["x"]), int(saved["y"])
+            self.root.geometry(f"+{x}+{y}")
+            # Flush the queued move to the real Win32 window *now* -- _tick()
+            # calls _reassert_topmost() right after this method returns, which
+            # does a synchronous SetWindowPos via root.attributes("-topmost", ...).
+            # Without this flush, that call can win the race and the pending
+            # geometry change is silently dropped -- the same class of bug as
+            # the _place_initial()/_apply_overlay_styles() ordering documented
+            # in ARCHITECTURE.md §6.
+            self.root.update_idletasks()
+            self.last_known_pos = (x, y)
+            if ALIGNMENT_CONFIG.enabled:
+                ALIGNMENT_CONFIG.enabled = False
+                write_usage_cache({"enabled": False}, cache_path=ALIGNMENT_CONFIG_PATH)
+            write_usage_cache({"x": x, "y": y}, cache_path=WIDGET_POS_PATH)
+
         def _place_initial(self):
             w = self.root.winfo_reqwidth()
             h = self.root.winfo_reqheight()
@@ -1225,8 +1271,9 @@ def run_app():
             if ALIGNMENT_CONFIG.enabled:
                 ALIGNMENT_CONFIG.enabled = False
                 write_usage_cache({"enabled": False}, cache_path=ALIGNMENT_CONFIG_PATH)
+            self.last_known_pos = (self.root.winfo_x(), self.root.winfo_y())
             write_usage_cache(
-                {"x": self.root.winfo_x(), "y": self.root.winfo_y()},
+                {"x": self.last_known_pos[0], "y": self.last_known_pos[1]},
                 cache_path=WIDGET_POS_PATH,
             )
             self._dragging = False
@@ -1318,6 +1365,9 @@ def run_app():
                         pass
                 self.root.quit()
                 return
+            if load_favorite_requested.is_set():
+                load_favorite_requested.clear()
+                self._apply_favorite_position()
             if widget_visible.is_set():
                 if not self.root.winfo_viewable():
                     self.root.deiconify()
@@ -1330,6 +1380,7 @@ def run_app():
                     now = time.monotonic()
                     if now - self._last_alignment_check > 30.0:
                         self._recheck_alignment()
+                self.last_known_pos = (self.root.winfo_x(), self.root.winfo_y())
             else:
                 self.root.withdraw()
             self.root.after(1000, self._tick)
@@ -1439,6 +1490,12 @@ def run_app():
             on_toggle_pin,
             checked=lambda item: position_pinned.is_set(),
         ))
+        items.append(pystray.MenuItem("Save current position as favorite", on_save_favorite))
+        items.append(pystray.MenuItem(
+            "Load favorite position",
+            on_load_favorite,
+            enabled=lambda item: read_usage_cache(cache_path=WIDGET_FAVORITE_POS_PATH) is not None,
+        ))
         items.append(pystray.MenuItem("Refresh now", on_refresh))
         items.append(pystray.MenuItem("Open logs folder", on_open_folder))
         items.append(pystray.MenuItem("Quit", on_quit))
@@ -1473,6 +1530,26 @@ def run_app():
         else:
             position_pinned.set()
             write_usage_cache({"pinned": True}, cache_path=WIDGET_PIN_PATH)
+
+    def on_save_favorite(icon, item):
+        # Tray thread. Reads the widget's position mirror (a plain tuple kept
+        # fresh by the Tk thread's _tick()/_end_drag()) -- never calls a
+        # Tkinter method directly, per ARCHITECTURE.md §5.
+        if widget is None:
+            return  # clicked before FloatingWidget() finished constructing
+        x, y = widget.last_known_pos
+        write_usage_cache({"x": x, "y": y}, cache_path=WIDGET_FAVORITE_POS_PATH)
+
+    def on_load_favorite(icon, item):
+        # Tray thread. Never touches widget.root directly -- just signals the
+        # Tk thread via an Event, same pattern as should_quit/widget_visible.
+        # The actual geometry() call happens inside
+        # FloatingWidget._tick() -> _apply_favorite_position().
+        if position_pinned.is_set():
+            return
+        if read_usage_cache(cache_path=WIDGET_FAVORITE_POS_PATH) is None:
+            return
+        load_favorite_requested.set()
 
     def on_quit(icon, item):
         should_quit.set()
@@ -1880,6 +1957,85 @@ def run_tests():
             "and _apply_overlay_styles() — without it, the pending geometry move is " \
             "cancelled by Win32 message processing during style setup, leaving widget at (0,0)"
         print("__init__ flushes geometry before _apply_overlay_styles: OK")
+
+        # --- favorite-position feature: cross-thread-safety guards ---
+        # Unlike Guards 1-3 above, these don't encode a bug that actually
+        # happened here — they encode CLAUDE.md's "no cross-thread Tkinter
+        # calls" rule preemptively for this new feature, so a future refactor
+        # can't casually reintroduce a tray-thread call into widget.root.
+
+        def _handler_body(name):
+            """Extract the body of a 4-space-indented on_* tray handler
+            (signature `(icon, item)`) from the source, stripping docstrings
+            and comment-only lines."""
+            m = re.search(
+                rf"\n    def {re.escape(name)}\(icon, item\):(.*?)(?=\n    def |\Z)",
+                _src, re.DOTALL,
+            )
+            assert m, f"{name} not found in source"
+            body = re.sub(r'""".*?"""', "", m.group(1), flags=re.DOTALL)
+            return "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+
+        # Guard 4: on_save_favorite (tray thread) must read the position mirror,
+        # never touch Tkinter directly.
+        _osf = _handler_body("on_save_favorite")
+        for _forbidden in ("winfo_x", "winfo_y", ".geometry(", "widget.root"):
+            assert _forbidden not in _osf, (
+                f"REGRESSION: on_save_favorite (tray thread) must not call {_forbidden!r} "
+                "directly -- read widget.last_known_pos (a plain tuple mirrored by the Tk "
+                "thread's _tick()/_end_drag()) instead."
+            )
+        assert "last_known_pos" in _osf, (
+            "REGRESSION: on_save_favorite must read widget.last_known_pos, not "
+            "recompute the position itself"
+        )
+        print("on_save_favorite does not touch Tkinter directly: OK")
+
+        # Guard 5: on_load_favorite must only signal an Event.
+        _olf = _handler_body("on_load_favorite")
+        for _forbidden in ("winfo_x", "winfo_y", ".geometry(", "widget.root"):
+            assert _forbidden not in _olf, (
+                f"REGRESSION: on_load_favorite (tray thread) must not call {_forbidden!r} "
+                "directly -- it must only set load_favorite_requested and let the Tk "
+                "thread's _tick() apply the geometry change itself."
+            )
+        assert "load_favorite_requested.set()" in _olf, (
+            "REGRESSION: on_load_favorite must signal the Tk thread via "
+            "load_favorite_requested.set(), not move the window itself"
+        )
+        print("on_load_favorite only signals an Event, never touches Tkinter: OK")
+
+        # Guard 6: the Tk-side application of a loaded favorite must happen
+        # inside _tick() (or a method _tick() calls), never inside an on_* handler.
+        _tick_body = _method_body("_tick")
+        assert "_apply_favorite_position()" in _tick_body, (
+            "REGRESSION: _tick() must call self._apply_favorite_position() -- this "
+            "is the only place load_favorite_requested may be consumed and applied"
+        )
+        _afp = _method_body("_apply_favorite_position")
+        assert ".geometry(" in _afp, (
+            "_apply_favorite_position must actually call self.root.geometry(...) -- "
+            "this is the one and only place a favorite-position load may touch Tkinter"
+        )
+        print("_apply_favorite_position is Tk-thread-only, invoked from _tick(): OK")
+
+        # Guard 7: _apply_favorite_position must flush the queued geometry move
+        # with update_idletasks() before returning.
+        #
+        # Background: _tick() calls _reassert_topmost() (root.attributes(
+        # "-topmost", ...), a synchronous SetWindowPos) immediately after
+        # _apply_favorite_position() returns, within the same tick. Without
+        # flushing first, that call wins the race and silently drops the
+        # pending geometry() move -- confirmed on real Windows hardware: the
+        # favorite position saved correctly but "Load favorite position"
+        # visibly did nothing. Same underlying class of bug as the
+        # _place_initial()/_apply_overlay_styles() ordering fix above.
+        assert _afp.index(".geometry(") < _afp.index("update_idletasks()"), (
+            "REGRESSION: _apply_favorite_position must call update_idletasks() "
+            "right after self.root.geometry(...) -- otherwise _reassert_topmost(), "
+            "called next in the same _tick() invocation, can cancel the pending move"
+        )
+        print("_apply_favorite_position flushes geometry before returning: OK")
 
         print("\nALL TESTS PASSED")
     finally:

@@ -333,6 +333,29 @@ only matters for the very first launch ever — low stakes, but worth
 flagging clearly as "designed, not field-verified" if you're asked about
 it.
 
+### Favorite widget position (single slot)
+
+A fourth small JSON sidecar, `usage_tray_widget_favorite_pos.json`
+(`WIDGET_FAVORITE_POS_PATH`), holds one user-designated "return to this
+spot" position — independent of `usage_tray_widget_pos.json`, which always
+tracks wherever the widget last ended up (drag, alignment, or a favorite
+load). It's a single slot by deliberate choice, not a named list, per an
+explicit product decision — this was raised and decided directly with the
+project owner rather than assumed.
+
+Two tray menu items back it: "Save current position as favorite" reads
+`FloatingWidget.last_known_pos` (a plain tuple mirrored from the Tk thread
+into a shared attribute after every reposition — `__init__`, `_end_drag()`,
+`_tick()`) rather than calling any Tkinter getter from the tray thread.
+"Load favorite position" sets `load_favorite_requested` (a
+`threading.Event`), which `FloatingWidget._tick()` polls and applies via
+`_apply_favorite_position()` — the newest instance of the
+flag-set-elsewhere/polled-in-`_tick()` pattern already described in §5, not
+a new mechanism. Loading a favorite also disables `ALIGNMENT_CONFIG.enabled`
+and overwrites `usage_tray_widget_pos.json`, mirroring exactly what
+`_end_drag()` already does, so a restart keeps the loaded favorite as the
+new baseline instead of reverting to wherever the widget was before the load.
+
 ## 7. Testing philosophy
 
 `python claude_usage_tray.py --test` runs a self-contained suite with
@@ -379,6 +402,7 @@ Everything this app reads or writes, and why:
 | `~/.claude/projects/**/*.jsonl` | Claude Code itself (not us) | `UsageTracker` | Token usage, cost, model/project breakdown. Read-only to us. |
 | `~/.claude/usage_tray_cache.json` | `--statusline-hook` mode | tray menu, floating widget | Session (5h) %, weekly (7d) %, context-window %, reset timestamps. Atomic write (temp file + `os.replace`). |
 | `~/.claude/usage_tray_widget_pos.json` | `FloatingWidget._end_drag()` | `FloatingWidget._default_position()` | Remembers where the user dragged the widget, so the taskbar-detection heuristic only applies once, ever. |
+| `~/.claude/usage_tray_widget_favorite_pos.json` | tray menu's "Save current position as favorite" (`on_save_favorite`, via `widget.last_known_pos`) | `FloatingWidget._apply_favorite_position()`; "Load favorite position" menu item's `enabled=` check | User-designated single favorite screen position, independent of the last-dragged position (`usage_tray_widget_pos.json`). Same atomic-write shape. |
 | `~/.claude/settings.json` | the user, manually | Claude Code itself | Where `statusLine.command` is wired to point at `python ... --statusline-hook`. Not managed by this app — just documented. |
 
 ## 9. Known limitations and things explicitly not verified

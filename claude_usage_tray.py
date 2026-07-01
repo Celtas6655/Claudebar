@@ -695,6 +695,132 @@ def find_tray_notification_rect():
 
 
 # --------------------------------------------------------------------------
+# Windows startup registration: HKCU\...\CurrentVersion\Run entry.
+# Uses winreg (stdlib) only -- imported lazily and only on Windows, same
+# lazy-import-behind-a-platform-guard pattern as the ctypes helpers above.
+# No admin rights needed (per-user hive). Registry ops fail soft, same as
+# file I/O elsewhere in this file -- never raise into a long-running thread.
+# --------------------------------------------------------------------------
+
+STARTUP_APP_NAME = "ClaudeUsageTray"   # matches build_exe.bat's --name
+STARTUP_RUN_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def build_startup_command(frozen, executable, script_path):
+    """Pure: decide the command line to register for Windows startup.
+
+    frozen/executable/script_path are explicit (not read from sys.* here)
+    so this is unit-testable on any OS without a real frozen build.
+
+    - frozen=True  -> the executable itself, quoted. A bare invocation
+      with no args already hits the `else: run_app()` branch at the
+      bottom of this file, so no extra args are needed.
+    - frozen=False -> prefers pythonw.exe next to `executable` (avoids a
+      console window flashing at login), falling back to `executable`
+      itself if no pythonw.exe is found alongside it. script_path is
+      quoted and passed as the sole argument.
+    """
+    if frozen:
+        return f'"{executable}"'
+    pythonw = os.path.join(os.path.dirname(executable), "pythonw.exe")
+    interpreter = pythonw if os.path.isfile(pythonw) else executable
+    return f'"{interpreter}" "{script_path}"'
+
+
+def _startup_registry_read(value_name, subkey=None, hive=None):
+    """Read a REG_SZ value from the given registry subkey.
+
+    subkey/hive default to STARTUP_RUN_SUBKEY/HKEY_CURRENT_USER but can be
+    overridden -- used by --test to point at a disposable test subkey
+    instead of the real Run key. Returns the string value, or None on any
+    failure (key/value missing, non-Windows, winreg unavailable,
+    permission error, etc.) Never raises.
+    """
+    if not sys.platform.startswith("win"):
+        return None
+    subkey = subkey if subkey is not None else STARTUP_RUN_SUBKEY
+    try:
+        import winreg
+        root = hive if hive is not None else winreg.HKEY_CURRENT_USER
+        with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ) as key:
+            value, _regtype = winreg.QueryValueEx(key, value_name)
+            return value
+    except (ImportError, OSError):
+        return None
+
+
+def _startup_registry_set(value_name, command, subkey=None, hive=None):
+    """Write value_name = command (REG_SZ) under the given registry
+    subkey, creating the subkey if needed. Returns True on success, False
+    on any failure. Never raises -- this may run on the tray's background
+    thread from a menu click, and must not kill it.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    subkey = subkey if subkey is not None else STARTUP_RUN_SUBKEY
+    try:
+        import winreg
+        root = hive if hive is not None else winreg.HKEY_CURRENT_USER
+        with winreg.CreateKeyEx(root, subkey, 0, winreg.KEY_WRITE) as key:
+            winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, command)
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+def _startup_registry_delete(value_name, subkey=None, hive=None):
+    """Remove value_name from the given registry subkey, if present.
+
+    Returns True if the value is now absent (whether just deleted or
+    already missing), False only on an unexpected failure (e.g.
+    permission error). Never raises.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    subkey = subkey if subkey is not None else STARTUP_RUN_SUBKEY
+    try:
+        import winreg
+        root = hive if hive is not None else winreg.HKEY_CURRENT_USER
+        with winreg.OpenKey(root, subkey, 0, winreg.KEY_WRITE) as key:
+            try:
+                winreg.DeleteValue(key, value_name)
+            except FileNotFoundError:
+                pass  # already absent -- not an error
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+def is_startup_enabled(value_name=None, subkey=None, hive=None):
+    """True if a Run-key entry named value_name currently exists. Any
+    value content counts as enabled -- a stale/renamed-path entry still
+    reads as enabled rather than silently reporting disabled."""
+    value_name = value_name or STARTUP_APP_NAME
+    return _startup_registry_read(value_name, subkey, hive) is not None
+
+
+def set_startup_enabled(enabled, value_name=None, subkey=None, hive=None,
+                          frozen=None, executable=None, script_path=None):
+    """Register or unregister the app for Windows startup.
+
+    frozen/executable/script_path default to the real running process's
+    sys.frozen/sys.executable/abspath(__file__), but are overridable so
+    --test can pass fabricated values without needing a real frozen exe.
+    Returns True on success, False on failure (including non-Windows,
+    where it's always a no-op False).
+    """
+    value_name = value_name or STARTUP_APP_NAME
+    if enabled:
+        frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+        executable = sys.executable if executable is None else executable
+        script_path = os.path.abspath(__file__) if script_path is None else script_path
+        command = build_startup_command(frozen, executable, script_path)
+        return _startup_registry_set(value_name, command, subkey, hive)
+    else:
+        return _startup_registry_delete(value_name, subkey, hive)
+
+
+# --------------------------------------------------------------------------
 # Rate-limit cache layer: session (5-hour) and weekly (7-day) usage % and
 # reset times aren't in the local JSONL logs -- they only exist inside
 # Claude Code's live connection to Anthropic's servers. Recent Claude Code
@@ -1527,6 +1653,12 @@ def run_app():
             on_toggle_pin,
             checked=lambda item: position_pinned.is_set(),
         ))
+        items.append(pystray.MenuItem(
+            "Run on Windows startup",
+            on_toggle_startup,
+            checked=lambda item: is_startup_enabled(),
+            enabled=lambda item: sys.platform.startswith("win"),
+        ))
         items.append(pystray.MenuItem("Save current position as favorite", on_save_favorite))
         items.append(pystray.MenuItem(
             "Load favorite position",
@@ -1567,6 +1699,12 @@ def run_app():
         else:
             position_pinned.set()
             write_usage_cache({"pinned": True}, cache_path=WIDGET_PIN_PATH)
+
+    def on_toggle_startup(icon, item):
+        # Tray thread. Fails soft -- see set_startup_enabled()/_startup_registry_*.
+        # The registry value itself is the source of truth, re-read fresh
+        # here and in the checked= lambda above -- no in-memory mirror needed.
+        set_startup_enabled(not is_startup_enabled())
 
     def on_save_favorite(icon, item):
         # Tray thread. Reads the widget's position mirror (a plain tuple kept
@@ -1896,6 +2034,70 @@ def run_tests():
         if not sys.platform.startswith("win"):
             assert find_tray_notification_rect() is None
             print("find_tray_notification_rect() correctly returns None off-Windows: OK")
+
+        # --- Windows startup registration: pure command-string logic ---
+        # Pure path/string logic -- runs on any OS, no registry involved.
+        cmd = build_startup_command(
+            frozen=True, executable=r"C:\Apps\ClaudeUsageTray.exe",
+            script_path=r"C:\Apps\claude_usage_tray.py",
+        )
+        assert cmd == '"C:\\Apps\\ClaudeUsageTray.exe"', cmd
+
+        cmd = build_startup_command(
+            frozen=False, executable=r"C:\Python312\python.exe",
+            script_path=r"C:\code\claude_usage_tray.py",
+        )
+        # no real pythonw.exe on disk at that fabricated path -> falls back to executable
+        assert cmd == '"C:\\Python312\\python.exe" "C:\\code\\claude_usage_tray.py"', cmd
+        print("build_startup_command (frozen / non-frozen, no pythonw present): OK")
+
+        # pythonw.exe preference: create a *real* file in the tmp sandbox so
+        # os.path.isfile() finds it, without touching any real Python install.
+        fake_pyw = os.path.join(tmp_home, "pythonw.exe")
+        with open(fake_pyw, "w", encoding="utf-8"):
+            pass
+        fake_py = os.path.join(tmp_home, "python.exe")
+        cmd = build_startup_command(
+            frozen=False, executable=fake_py, script_path=r"C:\code\claude_usage_tray.py",
+        )
+        assert cmd == f'"{fake_pyw}" "C:\\code\\claude_usage_tray.py"', cmd
+        print("build_startup_command prefers pythonw.exe when present alongside python.exe: OK")
+
+        # --- Windows startup registration: real registry round-trip (Windows only) ---
+        # Always uses a disposable test subkey, never STARTUP_RUN_SUBKEY (the real
+        # HKCU\...\CurrentVersion\Run) -- this must never register the test run itself.
+        if sys.platform.startswith("win"):
+            try:
+                import winreg
+                test_subkey = r"Software\ClaudeUsageTrayTestOnly_DoNotUseForRealStartup"
+                test_value_name = "ClaudeUsageTrayTest"
+                try:
+                    assert is_startup_enabled(test_value_name, test_subkey) is False
+
+                    ok = set_startup_enabled(
+                        True, value_name=test_value_name, subkey=test_subkey,
+                        frozen=True, executable=r"C:\fake\test.exe", script_path=r"C:\fake\test.py",
+                    )
+                    assert ok is True
+                    assert is_startup_enabled(test_value_name, test_subkey) is True
+
+                    ok = set_startup_enabled(
+                        False, value_name=test_value_name, subkey=test_subkey,
+                    )
+                    assert ok is True
+                    assert is_startup_enabled(test_value_name, test_subkey) is False
+                    print("Windows startup registry read/write/delete (disposable test subkey): OK")
+                finally:
+                    try:
+                        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, test_subkey)
+                    except OSError:
+                        pass
+            except ImportError:
+                print("winreg not available — skipping Windows startup registry test")
+        else:
+            assert is_startup_enabled() is False
+            assert set_startup_enabled(True) is False
+            print("Windows startup registration degrades gracefully off-Windows: OK")
 
         # --- z-order position algorithm ---
         # _zorder_position walks a top→bottom HWND chain and reports our position

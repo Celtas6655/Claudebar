@@ -111,9 +111,30 @@ above for why).
 
 ## Run it automatically when Windows starts
 
+Right-click the tray icon and check **"Run on Windows startup"**. This adds
+a per-user entry to
+`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` (no admin
+rights needed) that launches the app quietly at login — unchecking it
+removes the entry again. The menu item is grayed out on non-Windows
+platforms, since it's meaningless there.
+
+This is unit-tested against a disposable registry subkey but hasn't been
+confirmed end-to-end on a real login yet — if the app doesn't appear after
+enabling it, check Task Manager's Startup tab to confirm the entry was
+created, or `regedit` under the path above for a `ClaudeUsageTray` value.
+
+If you'd rather not have the app touch the registry at all, the manual
+alternative still works:
+
 1. Press `Win + R`, type `shell:startup`, press Enter.
 2. Drop a shortcut to `ClaudeUsageTray.exe` into that folder.
 3. It'll launch quietly in the tray every time you log in.
+
+**Note**: if you move, rename, or rebuild the `.exe` (or move the script,
+if running from source) after enabling the toggle, the registry entry
+still points at the old location and won't launch correctly until you
+toggle it off and back on from the new location. This isn't automatically
+repaired.
 
 ## Floating widget
 
@@ -180,6 +201,8 @@ widget just uses the screen-corner fallback instead — nothing breaks.
 - **Sessions seen**: number of distinct Claude Code sessions counted
 - **Refresh now**: force an immediate full rescan
 - **Open logs folder**: jumps straight to `~/.claude/projects` in Explorer
+- **Run on Windows startup**: toggle to launch the app automatically at
+  login (Windows only)
 
 Token totals update the moment Claude Code writes to a session file — a
 filesystem watcher reacts directly rather than checking on a timer

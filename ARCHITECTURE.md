@@ -404,6 +404,7 @@ Everything this app reads or writes, and why:
 | `~/.claude/usage_tray_widget_pos.json` | `FloatingWidget._end_drag()` | `FloatingWidget._default_position()` | Remembers where the user dragged the widget, so the taskbar-detection heuristic only applies once, ever. |
 | `~/.claude/usage_tray_widget_favorite_pos.json` | tray menu's "Save current position as favorite" (`on_save_favorite`, via `widget.last_known_pos`) | `FloatingWidget._apply_favorite_position()`; "Load favorite position" menu item's `enabled=` check | User-designated single favorite screen position, independent of the last-dragged position (`usage_tray_widget_pos.json`). Same atomic-write shape. |
 | `~/.claude/settings.json` | the user, manually | Claude Code itself | Where `statusLine.command` is wired to point at `python ... --statusline-hook`. Not managed by this app — just documented. |
+| `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`ClaudeUsageTray` value) | tray menu's "Run on Windows startup" toggle (`on_toggle_startup` → `set_startup_enabled`) | Windows itself, at login | Per-user autostart registration. Not a file, but the same "external state this app manages" category — added/removed via `winreg`, no admin rights needed (HKCU, not HKLM). |
 
 ## 9. Known limitations and things explicitly not verified
 
@@ -446,6 +447,17 @@ advance:
   of a new/cleared session** — populates after the first completed
   response, not before. Don't mistake this for a bug during support
   conversations.
+- **The "Run on Windows startup" registry toggle's read/write/delete
+  logic is unit-tested against a disposable registry subkey (never the
+  real `...\CurrentVersion\Run`), and confirmed to actually round-trip on
+  real Windows via `--test`** — but the end-to-end behavior (does the app
+  really appear in the tray after a full logout/login cycle) has not been
+  manually confirmed. If someone reports the app not launching at login
+  after enabling the toggle, check Task Manager's Startup tab and
+  `regedit` for the `ClaudeUsageTray` value first. Also note: if the
+  `.exe`/script is moved, renamed, or rebuilt to a new path after the
+  toggle was enabled, the registry entry still points at the old
+  location — this isn't auto-repaired, by design (see README).
 
 ## 10. Operational gotchas discovered during real setup (worth keeping as institutional memory)
 

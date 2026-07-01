@@ -1,221 +1,269 @@
 # Claude Code Usage Tray
 
-A small Windows system tray app that shows live token usage, estimated
-cost, and your session/weekly rate-limit status for Claude Code — read
-straight from Claude Code's own local data.
+A small **Windows** system tray app + floating widget that shows live token
+usage, estimated cost, and your session/weekly rate-limit status for
+[Claude Code](https://claude.ai/code) — read straight from Claude Code's own
+local data.
 
 Everything lives in one file: `claude_usage_tray.py`.
 
-- No API key needed
-- No network access of its own
-- Conversation content is never read — only model names, token counts,
-  and rate-limit percentages
-
-## Quick start (running from Python)
-
-1. Install Python 3.10+ if you don't have it: https://www.python.org/downloads/
-   (on the installer's first screen, check **"Add python.exe to PATH"**)
-2. Open a terminal in this folder and run:
-   ```
-   pip install -r requirements.txt
-   python claude_usage_tray.py
-   ```
-3. A small icon appears in the system tray (bottom-right, may be in the
-   "hidden icons" overflow arrow). Hover it for a quick tooltip, right-click
-   for the full breakdown.
-
-## Running the test suite
+- **No API key needed** — it reads Claude Code's local session logs, not the API
+- **No network access of its own** — nothing is uploaded anywhere
+- **Privacy-preserving** — conversation content is never read, only model names,
+  token counts, and rate-limit percentages
+- **Real-time** — token totals update the instant Claude Code writes a turn (a
+  filesystem watcher reacts directly, no polling delay)
 
 ```
-python claude_usage_tray.py --test
+┌──────────────────────────────────────────────────────┐
+│  Today      12.3K tok   $0.05                        │
+│  5h  ███71%███  18:42   ·   7d  ██18%░░░░  Mon 09:00 │
+└──────────────────────────────────────────────────────┘
 ```
 
-Runs entirely against a temporary synthetic folder — never touches your
-real `~/.claude` data. Covers aggregation, cost calculation, incremental
-re-reads, duplicate-message handling, the statusLine payload parser, the
-usage-cache read/write round-trip, reset-time formatting, and (if
-`watchdog` is installed) measures live filesystem-watcher latency.
+The floating widget is a borderless, always-on-top panel — just two compact rows
+(no title bar, no close button): **Today**'s tokens and cost, then the **5h** and
+**7d** bars side by side. The percentage is drawn *inside* each colored bar, with
+its reset time next to it. The tray icon shows the same numbers on
+hover/right-click. *(Drop a real screenshot here once you have one.)*
+
+## Requirements
+
+- **Windows** (the tray icon, floating-widget placement, and startup toggle are
+  Windows-specific; `--test` and the statusLine hook run anywhere)
+- **Python 3.10+** — https://www.python.org/downloads/
+- Dependencies (installed via `requirements.txt`):
+  - `pystray` — system tray icon
+  - `Pillow` — draws the tray icon at runtime (no image file to ship)
+  - `watchdog` — filesystem watching for real-time updates
+  - `tkinter` — the floating widget; ships with the standard python.org
+    installer, no extra install
+
+> **Note:** `pywin32` is **not** required. First-run taskbar placement uses the
+> Windows API via `ctypes` from the standard library — nothing to install.
+
+## Quick start
+
+```bash
+git clone https://github.com/Celtas6655/claudebar-usage.git
+cd claudebar-usage
+pip install -r requirements.txt
+python claude_usage_tray.py
+```
+
+A small icon appears in the system tray (bottom-right, possibly tucked inside
+the "hidden icons" overflow arrow). Hover it for a quick tooltip, right-click for
+the full breakdown. A floating widget with the same live numbers also appears.
+
+> On the Python installer's first screen, check **"Add python.exe to PATH"**. If
+> `python` isn't found, close and reopen your terminal — a terminal opened before
+> Python was installed won't see the updated PATH.
 
 ## Token totals vs. session/weekly limits — two different data sources
 
-**Tokens, cost, top models** come from Claude Code's local session logs
-(`~/.claude/projects/**/*.jsonl`), which the app reads directly. No setup
-needed beyond running the app.
+This is the one thing worth understanding. The app surfaces two categories of
+data that come from completely different places:
 
-**Session (5-hour) % and weekly (7-day) %** — the same numbers shown by
-Claude Code's `/usage` command — are *not* stored locally anywhere.
-They only exist inside Claude Code's live connection to Anthropic's
-servers. The way to get them is to have Claude Code hand them to you
-directly, via its `statusLine` hook:
+**Tokens, cost, top models** come from Claude Code's local session logs
+(`~/.claude/projects/**/*.jsonl`), which the app reads directly. **No setup
+needed** beyond running the app.
+
+**Session (5-hour) % and weekly (7-day) %** — the same numbers shown by Claude
+Code's `/usage` command — are *not* stored locally anywhere. They only exist
+inside Claude Code's live connection to Anthropic's servers. The only way to get
+them is to have Claude Code hand them to you, via its `statusLine` hook.
 
 ### Setting up the statusLine hook (for session/weekly %)
 
-1. Open (or create) `~/.claude/settings.json` (on Windows:
-   `%USERPROFILE%\.claude\settings.json`) and merge in:
-   ```json
-   {
-     "statusLine": {
-       "type": "command",
-       "command": "python C:/full/path/to/claude_usage_tray.py --statusline-hook"
-     }
-   }
-   ```
-   Use the full path to this script, with forward slashes (Windows accepts
-   them fine in commands like this, and it avoids JSON backslash-escaping
-   headaches).
-2. Restart Claude Code. On your next turn, it'll start piping its session
-   data to the script, which caches the rate-limit numbers and also prints
-   a compact status line (e.g. `Claude Sonnet 4.6 | ctx 22% | 5h 34% | 7d 12%`)
-   at the bottom of your terminal.
-3. The tray app picks up that cache automatically — no restart needed.
-
-**Important:** for this hook, run it via plain `python ...`, not the
-bundled `.exe`. PyInstaller's windowed/`--noconsole` build (used for the
-tray icon so it doesn't pop up a console) detaches stdin/stdout, which
-breaks a tool that needs to read JSON from stdin and print text back. The
-tray icon and the statusLine hook are two different use cases for the
-same script — one wants no console, the other needs one.
-
-**Note:** the `rate_limits` field in Claude Code's statusLine payload is
-fairly recent (Claude Code ≥ v1.2.80-ish). If after setup the tray menu
-still says "Session/weekly %: not available yet", update Claude Code —
-older versions don't send that field at all, so there's nothing local to
-read until then.
-
-## Building a standalone .exe (no Python needed to run it afterwards)
-
-1. Run `build_exe.bat` (double-click it, or run it from a terminal).
-2. It installs PyInstaller and bundles everything into one file.
-3. Find `ClaudeUsageTray.exe` inside the new `dist` folder.
-4. Copy that .exe wherever you like — it's self-contained.
-
-By default PyInstaller stamps the .exe with its own generic icon. To give
-it the app's actual icon instead (the same green/yellow/red usage gauge
-the tray shows at runtime), generate `icon.ico` once and pass it to
-PyInstaller:
+**Easy way — let the app wire it up for you:**
 
 ```bash
-python generate_icon.py
-pyinstaller --onefile --noconsole --icon=icon.ico --name ClaudeUsageTray claude_usage_tray.py
+python claude_usage_tray.py --install-hook
 ```
 
-Add the `--icon=icon.ico` flag to whatever `pyinstaller` line is inside
-your `build_exe.bat` so future builds pick it up automatically. This is
-a separate asset from the tray icon: the tray icon is drawn by Pillow at
-runtime (no file needed), but the .exe's own file/taskbar icon has to be
-baked in at build time, so it needs a real `.ico` on disk.
+This merges the `statusLine` entry into `~/.claude/settings.json` for you
+(atomic write; it refuses to touch the file if it can't be parsed cleanly, so it
+won't corrupt an existing config). Then **restart Claude Code**.
 
-This exe is for the tray icon only. Keep using `python
-claude_usage_tray.py --statusline-hook` for the statusLine hook (see
-above for why).
+**Manual way** — open (or create) `~/.claude/settings.json` (on Windows:
+`%USERPROFILE%\.claude\settings.json`) and merge in:
 
-## Run it automatically when Windows starts
-
-Right-click the tray icon and check **"Run on Windows startup"**. This adds
-a per-user entry to
-`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` (no admin
-rights needed) that launches the app quietly at login — unchecking it
-removes the entry again. The menu item is grayed out on non-Windows
-platforms, since it's meaningless there.
-
-This is unit-tested against a disposable registry subkey but hasn't been
-confirmed end-to-end on a real login yet — if the app doesn't appear after
-enabling it, check Task Manager's Startup tab to confirm the entry was
-created, or `regedit` under the path above for a `ClaudeUsageTray` value.
-
-If you'd rather not have the app touch the registry at all, the manual
-alternative still works:
-
-1. Press `Win + R`, type `shell:startup`, press Enter.
-2. Drop a shortcut to `ClaudeUsageTray.exe` into that folder.
-3. It'll launch quietly in the tray every time you log in.
-
-**Note**: if you move, rename, or rebuild the `.exe` (or move the script,
-if running from source) after enabling the toggle, the registry entry
-still points at the old location and won't launch correctly until you
-toggle it off and back on from the new location. This isn't automatically
-repaired.
-
-## Floating widget
-
-Besides the tray icon, the app also shows a small always-on-top widget
-with the same live numbers — no hovering or clicking needed. Percentage
-bars are real drawn rectangles (not text characters), so they can't get
-clipped or overflow regardless of font:
-
-```
-┌───────────────────────────────────────┐
-│ Claude Code                         ×│
-│ Today           12.3K tok   $0.05    │
-│ Session 5h ███████░░░  71%  resets 18:42 │
-│ Weekly  7d  ██░░░░░░░░  18%  resets Mon 09:00 │
-└───────────────────────────────────────┘
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python C:/full/path/to/claude_usage_tray.py --statusline-hook"
+  }
+}
 ```
 
-- **Initial position**: on first run, it tries to sit just to the left of
-  your real taskbar tray icons (using `pywin32` to find the actual
-  notification-area rectangle on screen — see "About the taskbar
-  placement" below). If that can't be detected, it falls back to a
-  bottom-right corner estimate.
-- **Drag it anywhere** by clicking and holding on the widget — its
-  position is then remembered across restarts (the auto-placement above
-  only applies the very first time, before you've ever dragged it).
-- **Close it** with the small `×` in the corner, or toggle it from the
-  tray's right-click menu ("Floating widget").
-- The percentage bars are color-coded: green under 50%, yellow 50-80%,
-  red 80%+.
-- It shares the same data as the tray menu, so it needs the statusLine
-  hook (below) for the session/weekly lines to populate.
+Use the full path to the script, with forward slashes (Windows accepts them in
+commands like this, and it avoids JSON backslash-escaping headaches). Restart
+Claude Code.
 
-It's built with `tkinter`, which ships with the standard python.org
-Windows installer by default — no extra dependency for the widget itself.
+Either way: on your next turn, Claude Code starts piping its session data to the
+script, which caches the rate-limit numbers and prints a compact status line
+(e.g. `Claude Sonnet 4.6 | ctx 22% | 5h 34% | 7d 12%`) at the bottom of your
+terminal. The tray app and widget pick up that cache automatically — no restart
+of the app needed.
 
-### About the taskbar placement
+> **Run the hook via plain `python ...`, not the bundled `.exe`.**
+> PyInstaller's windowed/`--noconsole` build (used for the tray icon so it
+> doesn't pop a console) detaches stdin/stdout, which breaks a tool that needs to
+> read JSON from stdin and print text back. The tray icon and the statusLine hook
+> are two different use cases for the same script.
 
-Finding exactly where your tray icons are isn't something Python (or
-even Tkinter) can do on its own — it requires asking Windows directly
-for the taskbar's notification-area window handle, via `pywin32`
-(`win32gui.FindWindow("Shell_TrayWnd", ...)`). This only affects *where
-the widget appears the first time you ever run it* — once you've dragged
-it anywhere, your position is saved and used from then on instead.
-
-I can't fully verify this exact lookup myself (it needs a real Windows
-taskbar to query — my dev environment doesn't have one), so if the
-auto-placement on first launch looks off, that's the part to flag. The
-rest of the widget (sizing, rendering, drag, persistence, show/hide) I
-tested directly and confirmed working, including a real rendered
-screenshot during development.
-
-If `pywin32` isn't installed, the lookup is silently skipped and the
-widget just uses the screen-corner fallback instead — nothing breaks.
+> **The `rate_limits` field is fairly recent** in Claude Code's statusLine
+> payload (Claude Code ≥ v1.2.80-ish). If after setup the tray still says
+> "Session/weekly %: not available yet", update Claude Code — older versions
+> don't send that field at all. Also note it's typically empty on the very first
+> render of a new session and only populates after the first completed response,
+> so send a second message before concluding anything is wrong.
 
 ## What it shows
 
+Right-click the tray icon (or read the floating widget) for:
+
 - **Today** / **all-time**: total tokens and estimated USD cost
-- **Session (5h)**: % of your rolling 5-hour rate limit used, and when it
-  resets (needs the statusLine hook above)
+- **Session (5h)**: % of your rolling 5-hour rate limit used, and when it resets
+  *(needs the statusLine hook above)*
 - **Weekly (7d)**: % of your weekly rate limit used, and when it resets
-  (needs the statusLine hook above)
+  *(needs the statusLine hook above)*
 - **Context window**: how full the current conversation's context window is
 - **Top models**: which models are eating the most tokens
 - **Sessions seen**: number of distinct Claude Code sessions counted
 - **Refresh now**: force an immediate full rescan
 - **Open logs folder**: jumps straight to `~/.claude/projects` in Explorer
-- **Run on Windows startup**: toggle to launch the app automatically at
-  login (Windows only)
+- **Run on Windows startup**: toggle to launch the app automatically at login
+  (Windows only)
 
 Token totals update the moment Claude Code writes to a session file — a
-filesystem watcher reacts directly rather than checking on a timer
-(tested at ~6-16ms in development). Session/weekly % updates the moment
-the statusLine hook (above) writes a fresh cache, which happens on every
-Claude Code turn. A slower full rescan every 30 seconds runs only as a
-safety net.
+filesystem watcher reacts directly rather than checking on a timer (measured at
+~6–16 ms in development). Session/weekly % updates the moment the statusLine hook
+writes a fresh cache, which happens on every Claude Code turn. A slower full
+rescan every 30 seconds runs only as a safety net.
+
+## Floating widget
+
+Besides the tray icon, the app shows a small borderless, always-on-top widget
+with the same live numbers — no hovering or clicking needed. It's two compact
+rows (a `Today` line and the `5h`/`7d` bars side by side, as shown above) sized to
+tuck into your taskbar height. The percentage bars are real drawn rectangles (not
+text characters), so they can't be clipped or overflow regardless of font, with
+the percentage drawn centered inside each bar.
+
+- **Initial position**: on first run, it tries to sit just to the left of your
+  real taskbar tray icons, using the Windows API (via `ctypes` — stdlib, nothing
+  to install) to find the actual notification-area rectangle on screen. If that
+  can't be detected, it falls back to a bottom-right corner estimate.
+- **Drag it anywhere** by clicking and holding on the widget — its position is
+  then remembered across restarts (the auto-placement only applies the very first
+  time, before you've ever dragged it).
+- **Show/hide it** from the tray's right-click menu ("Floating widget"). There's
+  no close button on the widget itself — it's borderless by design so it blends
+  into the taskbar.
+- The percentage bars are color-coded: green under 50%, yellow 50–80%, red 80%+.
+- It shares the same data as the tray menu, so it needs the statusLine hook for
+  the session/weekly lines to populate.
+
+> The first-run taskbar placement is **best-effort and unverified on real
+> hardware** — it needs a live Windows taskbar to query, which the dev
+> environment doesn't have. It only affects where the widget appears the very
+> first time (before you drag it), and it falls back gracefully if detection
+> fails. If first-launch placement looks off, that's the part to flag. See
+> `ARCHITECTURE.md` for details.
+
+## Building a standalone .exe (no Python needed to run it afterwards)
+
+Generate the icon once, then bundle with PyInstaller:
+
+```bash
+pip install pyinstaller
+python generate_icon.py
+pyinstaller --onefile --noconsole --icon=icon.ico --name ClaudeUsageTray claude_usage_tray.py
+```
+
+The result is `dist/ClaudeUsageTray.exe` — self-contained; copy it wherever you
+like. The `--icon=icon.ico` flag stamps the app's actual usage-gauge icon onto
+the `.exe`; without it PyInstaller uses its own generic icon. (The tray icon
+itself is drawn by Pillow at runtime, but the `.exe`'s file/taskbar icon has to
+be baked in at build time, so it needs a real `.ico` on disk.)
+
+If you build often, wrap that `pyinstaller` line in a `build_exe.bat` of your
+own for convenience.
+
+> This `.exe` is for the tray icon only. Keep using
+> `python claude_usage_tray.py --statusline-hook` for the statusLine hook (see
+> above for why the windowed build can't do it).
+
+## Run it automatically when Windows starts
+
+Right-click the tray icon and check **"Run on Windows startup"**. This adds a
+per-user entry to
+`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` (no admin
+rights needed) that launches the app quietly at login — unchecking it removes the
+entry. The menu item is grayed out on non-Windows platforms.
+
+> The registry read/write is unit-tested against a disposable subkey but hasn't
+> been confirmed end-to-end across a real logout/login yet. If the app doesn't
+> appear after enabling it, check Task Manager's Startup tab or `regedit` under
+> the path above for a `ClaudeUsageTray` value.
+>
+> If you move, rename, or rebuild the `.exe` (or move the script, if running from
+> source) after enabling the toggle, the registry entry still points at the old
+> location and won't launch correctly until you toggle it off and back on from
+> the new location. This isn't auto-repaired.
+
+Prefer not to touch the registry? The manual alternative works too: press
+`Win + R`, type `shell:startup`, press Enter, and drop a shortcut to the `.exe`
+(or a `python claude_usage_tray.py` launcher) into that folder.
 
 ## About the cost estimate
 
 There's a small price table near the top of `claude_usage_tray.py`
-(`PRICES_PER_MILLION`, USD per million tokens, for input / output /
-cache-write / cache-read across the Opus / Sonnet / Haiku tiers). These
-rates can change — if the numbers look off, check
-https://platform.claude.com/docs/en/about-claude/pricing and update the
-dict.
+(`PRICES_PER_MILLION`, USD per million tokens, for input / output / cache-write /
+cache-read across the Opus / Sonnet / Haiku tiers). These rates change over time
+and aren't wired to any live source — if the numbers look off, check
+https://platform.claude.com/docs/en/about-claude/pricing and update the dict.
+
+## Running the test suite
+
+```bash
+python claude_usage_tray.py --test
+```
+
+Runs entirely against a temporary synthetic folder — it never touches your real
+`~/.claude` data and needs no GUI backend (no `pystray`/`Pillow`/`tkinter`), so
+it works in a bare CI container. Covers aggregation, cost calculation,
+incremental re-reads, duplicate-message handling, the statusLine payload parser,
+the usage-cache read/write round-trip, reset-time formatting, the startup-toggle
+registry round-trip, and (if `watchdog` is installed) live filesystem-watcher
+latency.
+
+## Project layout & further reading
+
+| File | What it is |
+|---|---|
+| `claude_usage_tray.py` | The entire app — tray, widget, tracker, statusLine hook, tests. Deliberately single-file. |
+| `generate_icon.py` | Generates `icon.ico` for the PyInstaller build. |
+| `requirements.txt` | Runtime dependencies. |
+| `ARCHITECTURE.md` | Deep design & decision history — the two data sources, threading model, two bug postmortems, what's verified vs. not. **Read this before any architectural change.** |
+| `CLAUDE.md` | Short index / guidance for AI agents working in this repo. |
+
+## Contributing
+
+Contributions welcome. A few conventions this project holds to:
+
+- Run `python claude_usage_tray.py --test` before opening a PR — it must stay
+  green and GUI-free.
+- Keep **pure, testable logic at module level** and **GUI-only code as closures
+  inside `run_app()`** — that split is what lets `--test` run without a display.
+- Be direct about what's verified vs. not (some behaviors can only be confirmed
+  on real Windows hardware).
+- See `ARCHITECTURE.md` and `CLAUDE.md` for the non-negotiable constraints
+  (atomic cache writes, no cross-thread Tkinter calls, don't size a window before
+  rendering its content, etc.).
+
+## License
+
+Released under the [MIT License](LICENSE).

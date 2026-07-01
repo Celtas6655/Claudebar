@@ -1,0 +1,33 @@
+name: CI
+
+# Runs the test suite on pull requests and on pushes to the long-lived
+# branches. This is the check that branch protection on `master` requires:
+# the job is named `test`, so the required status-check context is `test`.
+#
+# Deliberately GUI-free -- `--test` imports no pystray/Pillow/tkinter and never
+# touches a real ~/.claude, so it runs on a bare runner with no display. The
+# full exe build + hook smoke test lives in release.yml (push to master only).
+on:
+  pull_request:
+    branches: [master, develop]
+  push:
+    branches: [master, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run test suite
+        run: python claude_usage_tray.py --test

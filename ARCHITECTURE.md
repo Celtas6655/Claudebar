@@ -161,7 +161,7 @@ accident of how it was first written.
 | `Pillow` | Static `.ico` asset | Tray icon is generated programmatically (a simple drawn circle) so there's no binary asset to ship/track in the repo |
 | `watchdog` | Polling on a timer | Real-time was an explicit, later request ("is this real-time?") — OS-level filesystem-change notifications (`ReadDirectoryChangesW` on Windows under the hood) react in single-digit milliseconds vs. up to N seconds of polling lag |
 | `tkinter` (stdlib) | A second Electron/web view, a native win32 window | Ships with the standard python.org Windows installer by default, zero extra dependency, sufficient for a small HUD |
-| `pywin32` (optional) | Skipping precise placement entirely | Only way to ask Windows directly where the real taskbar notification area is on screen; wrapped so its absence degrades gracefully, not a hard dependency |
+| `ctypes` (stdlib) taskbar lookup | `pywin32`, or skipping precise placement entirely | Asks Windows directly (via `user32` calls through `ctypes`) where the real taskbar notification area is on screen. Originally used `pywin32`; moved to `ctypes` so there's zero extra dependency to install. Wrapped so any failure degrades gracefully, never a hard requirement. |
 
 ## 5. Threading & concurrency model — read this before touching `run_app()`
 
@@ -315,18 +315,21 @@ change, recreate this harness as a throwaway script; don't merge it into
 ### Initial widget placement: best-effort taskbar detection
 
 On first run (no saved drag position yet), `_default_position()` tries
-`find_tray_notification_rect()`, which calls into `pywin32`
-(`win32gui.FindWindow("Shell_TrayWnd", None)` →
-`FindWindowEx(taskbar, 0, "TrayNotifyWnd", None)` →
-`GetWindowRect(...)`) to find the real screen coordinates of the
-notification area where tray icons live, and positions the widget just
-to its left, vertically centered on the taskbar's height. This is
+`find_tray_notification_rect()` (a thin wrapper over
+`find_taskbar_tray_rect()`), which calls the Win32 API directly through
+`ctypes` (`user32.FindWindowW("Shell_TrayWnd", None)` → walk its child
+tree for `TrayNotifyWnd` → `GetWindowRect(...)`) to find the real screen
+coordinates of the notification area where tray icons live, and
+positions the widget just to its left, vertically centered on the
+taskbar's height. `ctypes` is stdlib, so there's nothing to install —
+the earlier `pywin32` dependency was dropped. This is
 **explicitly unverified on real Windows hardware** — the dev sandbox has
 no Windows taskbar to query. It's wrapped defensively (`sys.platform`
-check, `try/except ImportError`, broad `except Exception` around the
-actual win32 calls) so any failure — wrong window classes on some
-Windows version, `pywin32` not installed, the taskbar being on a
-secondary monitor, etc. — falls back to a screen-corner heuristic
+check, broad `except Exception` around every `ctypes` call, and a
+reserved-width fallback when no tray child window can be located) so any
+failure — wrong window classes on some Windows version, the taskbar
+being on a secondary monitor, etc. — falls back to a screen-corner
+heuristic
 (`sw - w - 220, sh - h - 50`) rather than crashing. Because the user's
 own drag position is saved and preferred from then on, this heuristic
 only matters for the very first launch ever — low stakes, but worth

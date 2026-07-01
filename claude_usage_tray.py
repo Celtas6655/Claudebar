@@ -43,6 +43,7 @@ safety net.
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -1390,13 +1391,49 @@ def run_app():
 
 
     def make_icon_image():
+        # Drawn as a speedometer-style usage gauge -- green/yellow/red bands
+        # plus a needle -- using the same thresholds as pct_tag()/
+        # WIDGET_COLORS, so the tray icon is a tiny picture of what the app
+        # actually shows. Drawn at 4x and downsampled for anti-aliased edges;
+        # kept in sync by hand with generate_icon.py, which produces the
+        # static icon.ico used for the packaged .exe's own file icon.
         size = 64
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        scale = 4
+        s = size * scale
+        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        draw.ellipse((2, 2, size - 2, size - 2), fill=(204, 120, 92, 255))
-        draw.ellipse((10, 10, size - 10, size - 10), fill=(255, 255, 255, 230))
-        draw.ellipse((20, 20, size - 20, size - 20), fill=(204, 120, 92, 255))
-        return img
+
+        margin = s * 0.06
+        bbox = (margin, margin, s - margin, s - margin)
+        cx = cy = s / 2
+        r = (s - 2 * margin) / 2
+
+        gap_deg = 90
+        sweep = 360 - gap_deg
+        start = 90 + gap_deg / 2  # Pillow angles: 0=east, 90=south, clockwise
+        green_end = start + sweep * 0.50
+        yellow_end = green_end + sweep * 0.30
+        red_end = yellow_end + sweep * 0.20
+
+        draw.pieslice(bbox, start, green_end, fill=(95, 184, 95, 255))
+        draw.pieslice(bbox, green_end, yellow_end, fill=(224, 179, 65, 255))
+        draw.pieslice(bbox, yellow_end, red_end, fill=(224, 96, 90, 255))
+
+        # Punch a hole through the middle so the wedges read as a ring/gauge
+        # face rather than a solid pie.
+        hole_r = r * 0.55
+        draw.ellipse((cx - hole_r, cy - hole_r, cx + hole_r, cy + hole_r), fill=(0, 0, 0, 0))
+
+        needle_angle = math.radians(start + sweep * 0.62)
+        needle_len = r * 0.98
+        nx = cx + needle_len * math.cos(needle_angle)
+        ny = cy + needle_len * math.sin(needle_angle)
+        draw.line((cx, cy, nx, ny), fill=(45, 42, 40, 255), width=max(1, round(s * 0.05)))
+
+        pivot_r = s * 0.09
+        draw.ellipse((cx - pivot_r, cy - pivot_r, cx + pivot_r, cy + pivot_r), fill=(45, 42, 40, 255))
+
+        return img.resize((size, size), Image.LANCZOS)
 
     def build_title():
         snap = current_snapshot()

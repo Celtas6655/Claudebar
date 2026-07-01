@@ -89,6 +89,22 @@ read until then.
 3. Find `ClaudeUsageTray.exe` inside the new `dist` folder.
 4. Copy that .exe wherever you like — it's self-contained.
 
+By default PyInstaller stamps the .exe with its own generic icon. To give
+it the app's actual icon instead (the same green/yellow/red usage gauge
+the tray shows at runtime), generate `icon.ico` once and pass it to
+PyInstaller:
+
+```bash
+python generate_icon.py
+pyinstaller --onefile --noconsole --icon=icon.ico --name ClaudeUsageTray claude_usage_tray.py
+```
+
+Add the `--icon=icon.ico` flag to whatever `pyinstaller` line is inside
+your `build_exe.bat` so future builds pick it up automatically. This is
+a separate asset from the tray icon: the tray icon is drawn by Pillow at
+runtime (no file needed), but the .exe's own file/taskbar icon has to be
+baked in at build time, so it needs a real `.ico` on disk.
+
 This exe is for the tray icon only. Keep using `python
 claude_usage_tray.py --statusline-hook` for the statusLine hook (see
 above for why).

@@ -1,7 +1,8 @@
 # Claude Code Usage Tray
 
 A small **Windows** system tray app + floating widget that shows live token
-usage, estimated cost, and your session/weekly rate-limit status for
+usage, estimated cost, your session/weekly rate-limit status, and a
+Red/Amber/Green indicator of what Claude Code is doing right now for
 [Claude Code](https://claude.ai/code) — read straight from Claude Code's own
 local data.
 
@@ -13,6 +14,8 @@ Everything lives in one file: `claude_usage_tray.py`.
   token counts, and rate-limit percentages
 - **Real-time** — token totals update the instant Claude Code writes a turn (a
   filesystem watcher reacts directly, no polling delay)
+- **At-a-glance status** — a Red/Amber/Green dot shows whether Claude is
+  **working** (amber), **waiting on you** (red), or **done** (green)
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -139,6 +142,9 @@ of the app needed.
 
 Right-click the tray icon (or read the floating widget) for:
 
+- **Working state**: a Red/Amber/Green dot — amber while Claude is working, red
+  when it needs your input (a permission prompt / your next message), green when
+  it has just finished *(needs the event hooks — auto-installed, see below)*
 - **Today** / **all-time**: total tokens and estimated USD cost
 - **Session (5h)**: % of your rolling 5-hour rate limit used, and when it resets
   *(needs the statusLine hook above)*
@@ -157,6 +163,33 @@ filesystem watcher reacts directly rather than checking on a timer (measured at
 ~6–16 ms in development). Session/weekly % updates the moment the statusLine hook
 writes a fresh cache, which happens on every Claude Code turn. A slower full
 rescan every 30 seconds runs only as a safety net.
+
+## Working-state indicator (Red/Amber/Green)
+
+The widget shows a coloured dot (and the tray icon a matching corner pip) for
+what Claude Code is doing **right now**:
+
+- 🟡 **amber — working**: Claude submitted your prompt or is running a tool
+- 🔴 **red — waiting for you**: Claude needs your input (a permission prompt, or
+  your next message)
+- 🟢 **green — done**: Claude just finished a response
+- ⚫ **dim** when there's no recent signal (nothing has happened in the last few
+  minutes, or the hooks aren't set up yet)
+
+This can't be derived from the token logs — it's Claude Code's live per-turn
+lifecycle, which only its **event hooks** expose. So the app registers a tiny
+`--state-hook` command against a handful of events (`UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `Stop`, `Notification`) in
+`~/.claude/settings.json`. **This is auto-installed on startup**, the same way
+the statusLine hook is: the app only ever *adds* its own entries and never
+removes or edits any hooks you configured yourself. Restart Claude Code once
+after first launch for the events to start firing.
+
+**To turn it off**, remove the entries whose command ends in `--state-hook` from
+the `hooks` section of `~/.claude/settings.json`. Note the app re-adds them on
+its next launch (just like the statusLine hook), so if you want them gone for
+good, remove them while the app isn't running and don't relaunch it. Either way
+the indicator is harmless — with no hooks firing it simply stays **dim**.
 
 ## Floating widget
 
@@ -178,8 +211,11 @@ the percentage drawn centered inside each bar.
   no close button on the widget itself — it's borderless by design so it blends
   into the taskbar.
 - The percentage bars are color-coded: green under 50%, yellow 50–80%, red 80%+.
+- The `Today` row leads with the Red/Amber/Green **working-state dot** and a
+  short label (see the section above) — amber working, red waiting on you, green
+  done, dim when idle.
 - It shares the same data as the tray menu, so it needs the statusLine hook for
-  the session/weekly lines to populate.
+  the session/weekly lines and the event hooks for the working-state dot.
 
 > The first-run taskbar placement is **best-effort and unverified on real
 > hardware** — it needs a live Windows taskbar to query, which the dev
@@ -256,20 +292,21 @@ Runs entirely against a temporary synthetic folder — it never touches your rea
 `~/.claude` data and needs no GUI backend (no `pystray`/`Pillow`/`tkinter`), so
 it works in a bare CI container. Covers aggregation, cost calculation,
 incremental re-reads, duplicate-message handling, the statusLine payload parser,
-the usage-cache read/write round-trip, reset-time formatting, the startup-toggle
-registry round-trip, and (if `watchdog` is installed) live filesystem-watcher
-latency.
+the working-state event mapping and its hook installer (idempotent, preserves
+your own hooks), the usage-cache read/write round-trip, reset-time formatting,
+the startup-toggle registry round-trip, and (if `watchdog` is installed) live
+filesystem-watcher latency.
 
 ## Project layout & further reading
 
 | File | What it is |
 |---|---|
-| `claude_usage_tray.py` | The entire app — tray, widget, tracker, statusLine hook, hook auto-install, tests. Deliberately single-file. |
+| `claude_usage_tray.py` | The entire app — tray, widget, tracker, statusLine hook, working-state event hook, hook auto-install, tests. Deliberately single-file. |
 | `generate_icon.py` | Generates `icon.ico` for the PyInstaller build. |
 | `requirements.txt` | Runtime dependencies. |
 | `VERSION` | Single source of truth for the release version; the workflow tags from it. |
 | `.github/workflows/release.yml` | Builds the exe on push to `master` and publishes a GitHub release. |
-| `ARCHITECTURE.md` | Deep design & decision history — the two data sources, threading model, two bug postmortems, what's verified vs. not. **Read this before any architectural change.** |
+| `ARCHITECTURE.md` | Deep design & decision history — the three data sources, threading model, two bug postmortems, what's verified vs. not. **Read this before any architectural change.** |
 | `CLAUDE.md` | Short index / guidance for AI agents working in this repo. |
 
 ## Contributing

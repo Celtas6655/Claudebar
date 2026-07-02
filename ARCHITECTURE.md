@@ -140,6 +140,63 @@ the *first fully completed response*. Don't read "nothing showed up
 after one message" as a bug; send a second message before concluding
 anything is broken.
 
+### 2c. Current working state (the Red/Amber/Green indicator)
+
+**Source**: a *third* mechanism, separate again from the two above.
+Neither the JSONL logs nor the statusLine cache carries Claude Code's
+**live per-turn lifecycle** ("just started" / "running a tool" /
+"finished" / "waiting on you"). The only thing that exposes it is Claude
+Code's **event hooks** system: `~/.claude/settings.json` can register a
+command against lifecycle events, and Claude Code invokes that command
+(JSON payload on stdin, `hook_event_name` field naming the event) as each
+event fires. This is a distinct pathway from `statusLine` — statusLine is
+for the visible status text and only fires per render; hooks are for
+lifecycle notifications.
+
+**How we use it**: `claude_usage_tray.py --state-hook` is a third entry
+point in the same script, registered (auto, on startup) against the
+events in `STATE_HOOK_EVENTS`. The pure function `derive_working_state()`
+maps the incoming `hook_event_name` to one of three states, which the
+hook atomically writes to `~/.claude/usage_tray_state_cache.json`:
+
+| `hook_event_name` | state | colour |
+|---|---|---|
+| `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | `working` | amber |
+| `Stop` | `done` | green |
+| `Notification` (permission / needs-you) | `waiting` | red |
+| anything else / missing field | *(None — leave last state)* | — |
+
+Returning `None` for an unrecognised or absent event means the hook
+**doesn't overwrite** the cache, so an older Claude Code that omits
+`hook_event_name`, or a future event we don't handle, simply leaves the
+last known state in place rather than blanking it.
+
+**Staleness**: the reader (`working_state_tag()`) treats any cached state
+older than `STATE_STALE_SECONDS` (5 min) as unknown → a **dim** dot. This
+guards against a stuck "working" if a `Stop`/`Notification` is ever missed
+or the app is started mid-turn — there's no "turn ended" guarantee we can
+rely on, so we time it out.
+
+**Installation & non-clobber guarantee**: `install_state_hooks()` merges
+our `--state-hook` command into `settings["hooks"][<event>]` for each
+event, modelled on `install_statusline_hook()` (strict-parse guard, atomic
+temp-file + `os.replace`). It is **idempotent** (skips events where our
+exact command is already registered) and **non-destructive** (only ever
+*appends* our own matcher group; never removes or edits the user's own
+hooks). It writes only when something actually changed, so a normal
+startup doesn't churn `settings.json`. Auto-installed on every launch via
+`ensure_state_hooks_installed(..., force=False)`, exactly like the
+statusLine hook — `--install-state-hooks` is the force escape hatch.
+
+**Rendering**: the widget draws a small `Canvas` **oval** (RAG colour) plus
+a short label ("working" / "waiting for you" / "done") on its top row —
+drawn, never a Unicode `●` glyph (ARCHITECTURE.md §6). The tray icon adds a
+matching RAG **pip** in the gauge's corner via a parameterised
+`make_icon_image(state_tag)`, reassigned to `icon.icon` whenever the state
+file changes (watched by the existing non-recursive `CLAUDE_HOME`
+observer) and on the fallback sweep. The widget self-polls the state cache
+in its 1-second `_tick`, consistent with §5's model.
+
 ## 3. Why a single Python file
 
 This started as a multi-file Python project (`parser.py` + `app.py` +
@@ -404,9 +461,11 @@ Everything this app reads or writes, and why:
 |---|---|---|---|
 | `~/.claude/projects/**/*.jsonl` | Claude Code itself (not us) | `UsageTracker` | Token usage, cost, model/project breakdown. Read-only to us. |
 | `~/.claude/usage_tray_cache.json` | `--statusline-hook` mode | tray menu, floating widget | Session (5h) %, weekly (7d) %, context-window %, reset timestamps. Atomic write (temp file + `os.replace`). |
+| `~/.claude/usage_tray_state_cache.json` | `--state-hook` mode | tray icon (RAG pip), floating widget (RAG dot), tray menu/tooltip | Claude Code's current working state (`working`/`waiting`/`done`) + `updated_at`. Coloured Red/Amber/Green; treated as unknown (dim) past `STATE_STALE_SECONDS`. Atomic write. See §2c. |
+| `~/.claude/usage_tray_state_hooks_installed.json` | `write_state_hooks_marker` (via `ensure_state_hooks_installed`) | tray menu indicator; avoid redundant writes | Marker recording that *we* merged the `--state-hook` entries into `settings.json`'s `hooks` array, and the command we wrote. Separate sidecar, NOT a key in `settings.json`. Same atomic-write shape. |
 | `~/.claude/usage_tray_widget_pos.json` | `FloatingWidget._end_drag()` | `FloatingWidget._default_position()` | Remembers where the user dragged the widget, so the taskbar-detection heuristic only applies once, ever. |
 | `~/.claude/usage_tray_widget_favorite_pos.json` | tray menu's "Save current position as favorite" (`on_save_favorite`, via `widget.last_known_pos`) | `FloatingWidget._apply_favorite_position()`; "Load favorite position" menu item's `enabled=` check | User-designated single favorite screen position, independent of the last-dragged position (`usage_tray_widget_pos.json`). Same atomic-write shape. |
-| `~/.claude/settings.json` | the user, or this app's auto-install (`ensure_hook_installed`, only when no `statusLine` exists), or `--install-hook` (force) | Claude Code itself | Where `statusLine.command` is wired to point at the hook. On startup the app adds this entry itself if absent; it never clobbers a user's own `statusLine` unless `--install-hook` is used. Only ever writes the `statusLine` key — nothing else (a stray key would break the file's strict parse, §10). |
+| `~/.claude/settings.json` | the user, or this app's auto-install (`ensure_hook_installed` / `ensure_state_hooks_installed`), or `--install-hook` / `--install-state-hooks` (force) | Claude Code itself | Two things the app manages here: `statusLine.command` (rate-limit data, §2b) and `hooks.<event>[]` entries for `--state-hook` (working state, §2c). On startup it adds its `statusLine` when absent and its `hooks` entries when missing; it only ever **appends** its own hook groups and never removes/edits the user's own `statusLine` or `hooks` (unless the corresponding `--install-*` force flag is used). Writes nothing else — a stray key would break the file's strict parse, §10. |
 | `~/.claude/usage_tray_hook_installed.json` | `write_hook_marker` (via `ensure_hook_installed`) | tray menu indicator; `ensure_hook_installed` (avoid redundant writes) | Marker recording that *we* installed the statusLine hook, and the command we wrote. Deliberately a separate sidecar, NOT a key in `settings.json`. Same atomic-write shape. |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`ClaudeUsageTray` value) | tray menu's "Run on Windows startup" toggle (`on_toggle_startup` → `set_startup_enabled`) | Windows itself, at login | Per-user autostart registration. Not a file, but the same "external state this app manages" category — added/removed via `winreg`, no admin rights needed (HKCU, not HKLM). |
 

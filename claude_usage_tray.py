@@ -73,9 +73,31 @@ USAGE_CACHE_PATH = os.path.join(CLAUDE_HOME, "usage_tray_cache.json")
 # but the `statusLine` entry into it.
 HOOK_INSTALLED_MARKER_PATH = os.path.join(CLAUDE_HOME, "usage_tray_hook_installed.json")
 
+# Where the --state-hook mode caches Claude Code's *current working state*
+# (working / waiting-on-you / done), for the widget and tray icon to colour a
+# Red/Amber/Green indicator from. This is a THIRD data source, unrelated to the
+# token logs and the statusLine rate-limit cache: it comes from Claude Code's
+# event-hooks system (Stop/Notification/UserPromptSubmit/PreToolUse), the only
+# mechanism that exposes live per-turn lifecycle state. See ARCHITECTURE.md §2.
+STATE_CACHE_PATH = os.path.join(CLAUDE_HOME, "usage_tray_state_cache.json")
+
+# Marker recording that we've merged our --state-hook entries into settings.json's
+# `hooks` array (see ensure_state_hooks_installed). Separate sidecar for the same
+# reason as HOOK_INSTALLED_MARKER_PATH above.
+STATE_HOOKS_MARKER_PATH = os.path.join(CLAUDE_HOME, "usage_tray_state_hooks_installed.json")
+
+# A cached working state older than this (seconds) is treated as unknown (dim),
+# so a missed Stop hook or an app started mid-turn can't leave "working" stuck on.
+STATE_STALE_SECONDS = 300
+
+# Claude Code hook events we register --state-hook against, and the working state
+# each maps to. Order/keys mirror derive_working_state()'s logic; used both to
+# install the hooks and to reason about them. Notification == "Claude needs you".
+STATE_HOOK_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "Notification")
+
 # App version -- single source of truth, mirrored by the VERSION file at the
 # repo root that the release workflow reads to tag the build.
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Approximate USD price per 1M tokens: (input, output, cache_write, cache_read)
 # Anthropic's published per-model rates as of mid-2026 -- treat as a rough
@@ -304,6 +326,38 @@ def pct_tag(pct):
     if pct < 80:
         return "yellow"
     return "red"
+
+
+# Map an abstract working state to a WIDGET_COLORS key. RAG semantics (locked
+# with the user): working -> amber (yellow), waiting-on-you -> red, done ->
+# green. Kept as a table so derive_working_state, the widget dot, and the tray
+# pip all agree.
+STATE_TAGS = {"working": "yellow", "waiting": "red", "done": "green"}
+STATE_LABELS = {"working": "working", "waiting": "waiting for you", "done": "done"}
+
+
+def working_state_tag(state, updated_at=None, now=None):
+    """Color-threshold name for a working state, honouring staleness.
+
+    Returns a WIDGET_COLORS key ("yellow"/"red"/"green"/"dim"). An unknown
+    state, or one whose ``updated_at`` is older than STATE_STALE_SECONDS,
+    degrades to "dim" so a missed Stop hook can't leave the indicator stuck.
+    """
+    if state not in STATE_TAGS:
+        return "dim"
+    if updated_at is not None:
+        now = now if now is not None else time.time()
+        if now - updated_at > STATE_STALE_SECONDS:
+            return "dim"
+    return STATE_TAGS[state]
+
+
+def working_state_label(state, updated_at=None, now=None):
+    """Short human label for a working state ("working"/"waiting for you"/
+    "done"), or a dash when unknown or stale (mirrors working_state_tag)."""
+    if working_state_tag(state, updated_at, now) == "dim":
+        return "—"
+    return STATE_LABELS[state]
 
 
 # --------------------------------------------------------------------------
@@ -756,6 +810,17 @@ def build_hook_command(frozen, executable, script_path):
     return f'"{executable}" "{script_path}" --statusline-hook'
 
 
+def build_state_hook_command(frozen, executable, script_path):
+    """Pure: the command line to register in settings.json's `hooks` array for
+    the working-state indicator. Mirror of build_hook_command, but with the
+    --state-hook flag. Same frozen-vs-python shapes so the single windowed exe
+    handles this mode too (the hook path reads fd 0 directly, see
+    _read_hook_stdin)."""
+    if frozen:
+        return f'"{executable}" --state-hook'
+    return f'"{executable}" "{script_path}" --state-hook'
+
+
 def _startup_registry_read(value_name, subkey=None, hive=None):
     """Read a REG_SZ value from the given registry subkey.
 
@@ -889,6 +954,29 @@ def process_statusline_payload(payload):
         parts.append(f"7d {cache['weekly_used_percentage']:.0f}%")
     status_line_text = " | ".join(parts)
     return cache, status_line_text
+
+
+def derive_working_state(payload):
+    """Pure: turn one Claude Code hook payload into a working-state string, or
+    None when the event doesn't map to a state we track.
+
+    Mapping (locked with the user):
+      UserPromptSubmit / PreToolUse / PostToolUse -> "working"  (amber)
+      Stop                                        -> "done"     (green)
+      Notification                                -> "waiting"  (red, needs you)
+
+    None (unrecognised or missing ``hook_event_name``) means "leave the last
+    known state alone" -- so an older Claude Code that omits the field, or a
+    future event we don't handle, simply doesn't overwrite the cache. Kept
+    separate from I/O so it's testable."""
+    event = (payload or {}).get("hook_event_name")
+    if event in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
+        return "working"
+    if event == "Stop":
+        return "done"
+    if event == "Notification":
+        return "waiting"
+    return None
 
 
 def write_usage_cache(cache, cache_path=None):
@@ -1039,6 +1127,156 @@ def run_install_hook():
         sys.exit(1)
 
 
+def install_state_hooks(settings_path, command, force=False):
+    """Merge our working-state hook `command` into settings.json's `hooks` array
+    for each event in STATE_HOOK_EVENTS.
+
+    Non-destructive and idempotent: for each event we append a matcher group
+    pointing at `command` only when that exact command isn't already registered
+    there; we never remove or edit the user's own hook groups. Writes only when
+    something actually changed, so a normal startup doesn't churn settings.json.
+
+    Refuses to touch the file if it exists but won't parse — a corrupt
+    settings.json is worse than a missing indicator (one stray comma kills the
+    whole file). `force` is accepted for signature-symmetry with
+    install_statusline_hook; there's no foreign command to overwrite here, so it
+    has no effect.
+
+    Returns (success: bool, message: str). Fail-soft on write errors.
+    """
+    entry = {"type": "command", "command": command}
+
+    settings = {}
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return False, (
+                f"settings.json exists but couldn't be parsed: {exc}\n"
+                "Fix the JSON manually, then re-run --install-state-hooks."
+            )
+        except OSError as exc:
+            return False, f"Couldn't read settings.json: {exc}"
+
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+
+    def _command_present(groups):
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for h in group.get("hooks") or []:
+                if isinstance(h, dict) and h.get("command") == command:
+                    return True
+        return False
+
+    changed = False
+    for event in STATE_HOOK_EVENTS:
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            groups = []
+        if _command_present(groups):
+            continue
+        groups.append({"matcher": "", "hooks": [dict(entry)]})
+        hooks[event] = groups
+        changed = True
+
+    if not changed:
+        return True, "working-state hooks already configured — nothing to change."
+
+    settings["hooks"] = hooks
+
+    try:
+        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+        tmp = settings_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, settings_path)
+    except OSError as exc:
+        return False, f"Couldn't write settings.json: {exc}"
+
+    return True, (
+        f"Registered the working-state indicator hooks "
+        f"({', '.join(STATE_HOOK_EVENTS)}).\n"
+        f"Written to: {settings_path}\n"
+        "Restart Claude Code for the change to take effect."
+    )
+
+
+def _state_hooks_installed(settings_path, command):
+    """True when `command` is registered under EVERY event in STATE_HOOK_EVENTS
+    in settings.json — i.e. our state hooks are fully in place."""
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    for event in STATE_HOOK_EVENTS:
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            return False
+        found = False
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for h in group.get("hooks") or []:
+                if isinstance(h, dict) and h.get("command") == command:
+                    found = True
+        if not found:
+            return False
+    return True
+
+
+def write_state_hooks_marker(command, marker_path=None):
+    """Record that our working-state hooks are in place. Atomic, fail-soft."""
+    marker_path = marker_path or STATE_HOOKS_MARKER_PATH
+    write_usage_cache({"installed": True, "command": command}, cache_path=marker_path)
+
+
+def read_state_hooks_marker(marker_path=None):
+    """Read the state-hooks-installed marker sidecar, or None if absent."""
+    marker_path = marker_path or STATE_HOOKS_MARKER_PATH
+    return read_usage_cache(cache_path=marker_path)
+
+
+def ensure_state_hooks_installed(settings_path, command, marker_path, force=False):
+    """Make sure our --state-hook command is registered for every
+    STATE_HOOK_EVENTS event, and record a marker sidecar when it is.
+
+    Called on every app startup (force is a no-op here — see install_state_hooks):
+    idempotent, only appends our own entries, never removes/alters the user's
+    other hooks. Returns (success, message). Fail-soft; never raises."""
+    success, message = install_state_hooks(settings_path, command, force=force)
+    if success and _state_hooks_installed(settings_path, command):
+        write_state_hooks_marker(command, marker_path)
+    return success, message
+
+
+def _resolve_state_hook_command():
+    """The --state-hook command line for the current process (frozen exe or
+    plain python), via build_state_hook_command."""
+    frozen = getattr(sys, "frozen", False)
+    return build_state_hook_command(frozen, sys.executable, os.path.abspath(__file__))
+
+
+def run_install_state_hooks():
+    """Entry point for --install-state-hooks: (re)registers this app's
+    --state-hook command for the working-state indicator events."""
+    settings_path = os.path.join(CLAUDE_HOME, "settings.json")
+    success, message = ensure_state_hooks_installed(
+        settings_path, _resolve_state_hook_command(), STATE_HOOKS_MARKER_PATH, force=True,
+    )
+    _write_hook_stdout(message)
+    if not success:
+        sys.exit(1)
+
+
 def _read_hook_stdin():
     """Read the raw statusLine payload bytes from standard input.
 
@@ -1111,6 +1349,36 @@ def run_statusline_hook():
     _write_hook_stdout(status_line_text)
 
 
+def run_state_hook():
+    """Entry point for `... --state-hook`, wired into Claude Code's `hooks`
+    array for several lifecycle events (see STATE_HOOK_EVENTS). Reads the hook
+    JSON payload from stdin, derives Claude's current working state, and — when
+    the event maps to one — atomically caches it so the widget and tray icon can
+    colour a Red/Amber/Green indicator.
+
+    Emits nothing on stdout and always exits 0: a hook that errors or prints
+    junk would surface to the user on every turn. Uses the fd-safe stdin reader
+    so the windowed frozen exe works too (see _read_hook_stdin)."""
+    try:
+        payload = json.loads(_read_hook_stdin().decode("utf-8", "replace"))
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+    try:
+        state = derive_working_state(payload)
+        if state is not None:
+            write_usage_cache(
+                {
+                    "state": state,
+                    "event": payload.get("hook_event_name"),
+                    "session_id": payload.get("session_id"),
+                    "updated_at": time.time(),
+                },
+                cache_path=STATE_CACHE_PATH,
+            )
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------
 # Tray app. GUI/watcher dependencies (pystray, Pillow, watchdog) are
 # imported lazily inside this function, only when actually running the
@@ -1132,6 +1400,18 @@ def run_app():
         ensure_hook_installed(
             os.path.join(CLAUDE_HOME, "settings.json"),
             _resolve_hook_command(), HOOK_INSTALLED_MARKER_PATH, force=False,
+        )
+    except Exception:
+        pass
+
+    # Same zero-setup treatment for the working-state indicator: register our
+    # --state-hook command for the lifecycle events (STATE_HOOK_EVENTS) so
+    # Claude Code reports live working/waiting/done state. Only appends our own
+    # hook entries, never touching the user's other hooks. Fail-soft.
+    try:
+        ensure_state_hooks_installed(
+            os.path.join(CLAUDE_HOME, "settings.json"),
+            _resolve_state_hook_command(), STATE_HOOKS_MARKER_PATH, force=False,
         )
     except Exception:
         pass
@@ -1169,6 +1449,13 @@ def run_app():
     def current_snapshot():
         with state_lock:
             return tracker.snapshot()
+
+    def current_state_tag():
+        """WIDGET_COLORS key for Claude's current working state, read fresh from
+        the state cache (dim when unknown/stale). Shared by the widget dot and
+        the tray-icon pip."""
+        st = read_usage_cache(cache_path=STATE_CACHE_PATH) or {}
+        return working_state_tag(st.get("state"), st.get("updated_at"))
 
     class FloatingWidget:
         """Small always-on-top, borderless window showing the same live
@@ -1219,10 +1506,29 @@ def run_app():
             frame = tk.Frame(self.root, bg=self.BG, padx=10, pady=_frame_pady)
             frame.pack(fill="both", expand=True)
 
-            self.today_label = tk.Label(
-                frame, font=("Consolas", _fs), fg=self.FG, bg=self.BG, anchor="w",
+            # Row 1: RAG working-state dot + today's tokens/cost + a short state
+            # label ("working"/"waiting for you"/"done"). The dot is a drawn
+            # Canvas oval, never a Unicode glyph, so its size is font-independent
+            # (ARCHITECTURE.md §6).
+            today_row = tk.Frame(frame, bg=self.BG)
+            today_row.pack(fill="x", pady=(_today_pady, _today_pady))
+
+            self._dot_d = max(6, self.BAR_H)
+            self.state_canvas = tk.Canvas(
+                today_row, width=self._dot_d, height=self._dot_d,
+                bg=self.BG, highlightthickness=0,
             )
-            self.today_label.pack(fill="x", pady=(_today_pady, _today_pady))
+            self.state_canvas.pack(side="left", padx=(0, 5))
+
+            self.today_label = tk.Label(
+                today_row, font=("Consolas", _fs), fg=self.FG, bg=self.BG, anchor="w",
+            )
+            self.today_label.pack(side="left", fill="x", expand=True)
+
+            self.state_label = tk.Label(
+                today_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG, anchor="e",
+            )
+            self.state_label.pack(side="right", padx=(6, 0))
 
             # Single row: session 5h and weekly 7d side-by-side
             metrics_row = tk.Frame(frame, bg=self.BG)
@@ -1253,7 +1559,8 @@ def run_app():
             )
             self.weekly_reset_lbl.pack(side="left", padx=(4, 0))
 
-            for w in (self.root, frame, self.today_label, metrics_row):
+            for w in (self.root, frame, today_row, self.state_canvas,
+                      self.today_label, self.state_label, metrics_row):
                 w.bind("<Button-1>", self._start_drag)
                 w.bind("<B1-Motion>", self._do_drag)
                 w.bind("<ButtonRelease-1>", self._end_drag)
@@ -1405,7 +1712,25 @@ def run_app():
             else:
                 reset_lbl.config(text="--", fg=self.DIM)
 
+        def _draw_status_dot(self):
+            """Draw the RAG working-state dot and set its label from the state
+            cache (written by --state-hook). Pixel-precise Canvas oval, not a
+            glyph, so it's font/DPI-independent."""
+            st = read_usage_cache(cache_path=STATE_CACHE_PATH) or {}
+            tag = working_state_tag(st.get("state"), st.get("updated_at"))
+            d = self._dot_d
+            self.state_canvas.delete("all")
+            # 1px inset so the oval's antialiased edge isn't clipped by the canvas.
+            self.state_canvas.create_oval(
+                1, 1, d - 1, d - 1, fill=WIDGET_COLORS[tag], outline="",
+            )
+            self.state_label.config(
+                text=working_state_label(st.get("state"), st.get("updated_at")),
+                fg=(self.DIM if tag == "dim" else WIDGET_COLORS[tag]),
+            )
+
         def _render(self):
+            self._draw_status_dot()
             snap = current_snapshot()
             today_tok = sum(snap["today_totals"].values())
             self.today_label.config(
@@ -1679,13 +2004,27 @@ def run_app():
             self.root.mainloop()
 
 
-    def make_icon_image():
+    # RGB tuples for the RAG working-state pip, keyed like WIDGET_COLORS.
+    # Duplicated as tuples (not the widget's hex strings) because Pillow wants
+    # RGBA; kept visually in sync with WIDGET_COLORS.
+    STATE_PIP_RGB = {
+        "green": (95, 184, 95, 255),
+        "yellow": (224, 179, 65, 255),
+        "red": (224, 96, 90, 255),
+        "dim": (136, 136, 136, 255),
+    }
+
+    def make_icon_image(state_tag=None):
         # Drawn as a speedometer-style usage gauge -- green/yellow/red bands
         # plus a needle -- using the same thresholds as pct_tag()/
         # WIDGET_COLORS, so the tray icon is a tiny picture of what the app
         # actually shows. Drawn at 4x and downsampled for anti-aliased edges;
         # kept in sync by hand with generate_icon.py, which produces the
         # static icon.ico used for the packaged .exe's own file icon.
+        #
+        # state_tag (a WIDGET_COLORS key) adds a small RAG working-state pip in
+        # the bottom-right corner; None leaves the plain gauge (used before any
+        # state is known).
         size = 64
         scale = 4
         s = size * scale
@@ -1722,7 +2061,37 @@ def run_app():
         pivot_r = s * 0.09
         draw.ellipse((cx - pivot_r, cy - pivot_r, cx + pivot_r, cy + pivot_r), fill=(45, 42, 40, 255))
 
+        # RAG working-state pip in the bottom-right corner, with a small dark
+        # ring so it reads clearly over any wedge colour behind it.
+        if state_tag in STATE_PIP_RGB:
+            pip_r = s * 0.20
+            pcx = s - pip_r - s * 0.02
+            pcy = s - pip_r - s * 0.02
+            ring = pip_r * 1.28
+            draw.ellipse((pcx - ring, pcy - ring, pcx + ring, pcy + ring), fill=(30, 30, 30, 255))
+            draw.ellipse(
+                (pcx - pip_r, pcy - pip_r, pcx + pip_r, pcy + pip_r),
+                fill=STATE_PIP_RGB[state_tag],
+            )
+
         return img.resize((size, size), Image.LANCZOS)
+
+    # Last RAG tag pushed to the tray icon, so apply_icon_state() only rebuilds
+    # the Pillow image when the state actually changes (not on every 30s sweep).
+    _icon_state = {"tag": None}
+
+    def apply_icon_state(icon):
+        """Recolor the tray icon's RAG pip from the current working state, but
+        only when it changed. Runs on the tray/watcher threads (never touches
+        Tk); pystray supports reassigning .icon at runtime."""
+        tag = current_state_tag()
+        if tag == _icon_state["tag"]:
+            return
+        _icon_state["tag"] = tag
+        try:
+            icon.icon = make_icon_image(tag)
+        except Exception:
+            pass
 
     def build_title():
         snap = current_snapshot()
@@ -1743,6 +2112,10 @@ def run_app():
                     f"Weekly: {cache['weekly_used_percentage']:.0f}% "
                     f"(resets {fmt_reset_clock(cache.get('weekly_resets_at')) or '?'})"
                 )
+        st = read_usage_cache(cache_path=STATE_CACHE_PATH) or {}
+        st_label = working_state_label(st.get("state"), st.get("updated_at"))
+        if st_label != "—":
+            lines.append(f"State: {st_label}")
         return "\n".join(lines)
 
     def menu_items():
@@ -1764,6 +2137,11 @@ def run_app():
             ),
             pystray.MenuItem(f"Sessions seen: {snap['session_count']}", None, enabled=False),
         ]
+
+        st = read_usage_cache(cache_path=STATE_CACHE_PATH) or {}
+        st_label = working_state_label(st.get("state"), st.get("updated_at"))
+        if st_label != "—":
+            items.append(pystray.MenuItem(f"State:    Claude is {st_label}", None, enabled=False))
 
         items.append(pystray.Menu.SEPARATOR)
         cache = read_usage_cache()
@@ -1899,12 +2277,16 @@ def run_app():
 
         def _handle(self, path):
             is_session_file = path.endswith(".jsonl")
-            is_usage_cache = os.path.basename(path) == os.path.basename(USAGE_CACHE_PATH)
-            if not (is_session_file or is_usage_cache):
+            base = os.path.basename(path)
+            is_usage_cache = base == os.path.basename(USAGE_CACHE_PATH)
+            is_state_cache = base == os.path.basename(STATE_CACHE_PATH)
+            if not (is_session_file or is_usage_cache or is_state_cache):
                 return
             if is_session_file:
                 with state_lock:
                     tracker.poll_file(path)
+            if is_state_cache:
+                apply_icon_state(self.icon)   # recolor the RAG pip promptly
             self.icon.title = build_title()
 
         def on_modified(self, event):
@@ -1935,16 +2317,18 @@ def run_app():
             with state_lock:
                 tracker.poll()
             icon.title = build_title()
+            apply_icon_state(icon)   # safety-net recolor (e.g. rolls to dim when stale)
 
     with state_lock:
         tracker.poll()  # initial full scan so the tray isn't empty on first open
 
     icon = pystray.Icon(
         "claude_usage_tray",
-        icon=make_icon_image(),
+        icon=make_icon_image(current_state_tag()),
         title=build_title(),
         menu=pystray.Menu(menu_items),
     )
+    _icon_state["tag"] = current_state_tag()   # seed so apply_icon_state dedupes
 
     threading.Thread(target=watcher_loop, args=(icon,), daemon=True).start()
     threading.Thread(target=fallback_sweep_loop, args=(icon,), daemon=True).start()
@@ -2254,6 +2638,103 @@ def run_tests():
         assert "hooktest" in _hline and "5h 50%" in _hline, _hline
         print("statusline payload -> status line text: OK")
 
+        # --- working-state indicator: event -> state mapping ---
+        assert derive_working_state({"hook_event_name": "UserPromptSubmit"}) == "working"
+        assert derive_working_state({"hook_event_name": "PreToolUse"}) == "working"
+        assert derive_working_state({"hook_event_name": "PostToolUse"}) == "working"
+        assert derive_working_state({"hook_event_name": "Stop"}) == "done"
+        assert derive_working_state({"hook_event_name": "Notification"}) == "waiting"
+        assert derive_working_state({"hook_event_name": "SessionStart"}) is None
+        assert derive_working_state({}) is None           # missing field -> no state
+        assert derive_working_state(None) is None
+        print("derive_working_state — event mapping + missing field: OK")
+
+        # --- working_state_tag / label: colour + staleness ---
+        _now = 1_000_000.0
+        assert working_state_tag("working", _now, _now) == "yellow"
+        assert working_state_tag("done", _now, _now) == "green"
+        assert working_state_tag("waiting", _now, _now) == "red"
+        assert working_state_tag(None, _now, _now) == "dim"
+        assert working_state_tag("bogus", _now, _now) == "dim"
+        # older than STATE_STALE_SECONDS -> dim, regardless of state
+        assert working_state_tag("working", _now - STATE_STALE_SECONDS - 1, _now) == "dim"
+        assert working_state_tag("working", None) == "yellow"   # no timestamp -> never stale
+        assert working_state_label("waiting", _now, _now) == "waiting for you"
+        assert working_state_label("working", _now - STATE_STALE_SECONDS - 1, _now) == "—"
+        print("working_state_tag/label — colour + staleness: OK")
+
+        # --- state cache write/read round-trip (temp path, never real ~/.claude) ---
+        state_cache_path = os.path.join(tmp_home, "state_cache.json")
+        write_usage_cache(
+            {"state": "working", "event": "PreToolUse", "session_id": "s1", "updated_at": _now},
+            cache_path=state_cache_path,
+        )
+        _sc = read_usage_cache(cache_path=state_cache_path)
+        assert _sc["state"] == "working" and _sc["event"] == "PreToolUse", _sc
+        print("state cache write/read round-trip: OK")
+
+        # --- state-hook command construction (pure, frozen-aware) ---
+        _sframe = build_state_hook_command(True, exe, script)
+        assert _sframe == f'"{exe}" --state-hook', _sframe
+        _spy = build_state_hook_command(False, py, script)
+        assert _spy == f'"{py}" "{script}" --state-hook', _spy
+        assert "python" not in _sframe.lower()
+        print("build_state_hook_command (frozen exe vs. python script): OK")
+
+        # --- install_state_hooks: register all events, idempotent, non-destructive ---
+        state_cmd = build_state_hook_command(False, "python", "/path/to/claude_usage_tray.py")
+        # (a) fresh install into a settings file that already has a foreign statusLine
+        #     and an unrelated user hook -> both must survive untouched.
+        st_settings = os.path.join(tmp_home, "settings_state.json")
+        with open(st_settings, "w", encoding="utf-8") as f:
+            json.dump({
+                "statusLine": {"type": "command", "command": "user-status"},
+                "hooks": {"Stop": [{"matcher": "", "hooks": [
+                    {"type": "command", "command": "user-own-stop-hook"}]}]},
+            }, f)
+        okS, msgS = install_state_hooks(st_settings, state_cmd)
+        assert okS, msgS
+        with open(st_settings, encoding="utf-8") as f:
+            sdata = json.load(f)
+        assert sdata["statusLine"]["command"] == "user-status", sdata   # untouched
+        for ev in STATE_HOOK_EVENTS:
+            cmds = [h.get("command")
+                    for g in sdata["hooks"][ev] for h in (g.get("hooks") or [])]
+            assert state_cmd in cmds, (ev, cmds)
+        # the user's own Stop hook must still be there alongside ours
+        stop_cmds = [h.get("command")
+                     for g in sdata["hooks"]["Stop"] for h in (g.get("hooks") or [])]
+        assert "user-own-stop-hook" in stop_cmds and state_cmd in stop_cmds, stop_cmds
+        print("install_state_hooks — registers all events, preserves user hooks + statusLine: OK")
+
+        # (b) idempotent: a second call changes nothing and reports so
+        okS2, msgS2 = install_state_hooks(st_settings, state_cmd)
+        assert okS2 and "already" in msgS2.lower(), msgS2
+        with open(st_settings, encoding="utf-8") as f:
+            sdata2 = json.load(f)
+        # no duplicate groups added for any event
+        for ev in STATE_HOOK_EVENTS:
+            our = [1 for g in sdata2["hooks"][ev] for h in (g.get("hooks") or [])
+                   if h.get("command") == state_cmd]
+            assert sum(our) == 1, (ev, sdata2["hooks"][ev])
+        print("install_state_hooks — idempotent, no duplicates: OK")
+
+        # (c) malformed settings.json -> abort without writing
+        st_broken = os.path.join(tmp_home, "settings_state_broken.json")
+        with open(st_broken, "w", encoding="utf-8") as f:
+            f.write('{"hooks": {},}')  # trailing comma -> invalid
+        okS3, _ = install_state_hooks(st_broken, state_cmd)
+        assert not okS3, "should refuse to write a malformed settings.json"
+        print("install_state_hooks — malformed JSON aborted cleanly: OK")
+
+        # (d) ensure_state_hooks_installed writes the marker once fully installed
+        st_marker = os.path.join(tmp_home, "state_hooks_marker.json")
+        okS4, _ = ensure_state_hooks_installed(st_settings, state_cmd, st_marker)
+        assert okS4 and _state_hooks_installed(st_settings, state_cmd)
+        _m = read_state_hooks_marker(marker_path=st_marker)
+        assert _m and _m.get("command") == state_cmd, _m
+        print("ensure_state_hooks_installed — marker written when in place: OK")
+
         # --- taskbar tray-rect detection: must degrade gracefully off-Windows ---
         if not sys.platform.startswith("win"):
             assert find_tray_notification_rect() is None
@@ -2518,13 +2999,28 @@ if __name__ == "__main__":
         help="add the statusLine hook entry to ~/.claude/settings.json so Claude "
              "Code starts piping rate-limit data to this script automatically",
     )
+    cli.add_argument(
+        "--state-hook", action="store_true",
+        help="read a Claude Code hook JSON payload from stdin and cache Claude's "
+             "current working state (working/waiting/done) for the RAG indicator; "
+             "wired into settings.json's hooks array (see README.md)",
+    )
+    cli.add_argument(
+        "--install-state-hooks", action="store_true",
+        help="register the working-state indicator hooks in ~/.claude/settings.json "
+             "so Claude Code reports its live state to this app",
+    )
     args = cli.parse_args()
 
     if args.test:
         run_tests()
     elif args.statusline_hook:
         run_statusline_hook()
+    elif args.state_hook:
+        run_state_hook()
     elif args.install_hook:
         run_install_hook()
+    elif args.install_state_hooks:
+        run_install_state_hooks()
     else:
         run_app()

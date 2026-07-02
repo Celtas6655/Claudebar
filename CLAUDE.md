@@ -8,9 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Windows tray app + floating widget showing live Claude Code token
 usage, estimated cost, and session (5h)/weekly (7d) rate-limit % with
-reset times. Single-file Python app: `claude_usage_tray.py`, run with no
-args for the app, `--test` for the test suite, `--statusline-hook` as
-the entry point wired into Claude Code's `statusLine` config.
+reset times, plus a Red/Amber/Green indicator of Claude Code's current
+working state. Single-file Python app: `claude_usage_tray.py`, run with
+no args for the app, `--test` for the test suite, `--statusline-hook` as
+the entry point wired into Claude Code's `statusLine` config, and
+`--state-hook` as the entry point wired into Claude Code's `hooks` events
+(for the working-state indicator).
 
 Full history — why it's built this way, two postmortem bug writeups,
 the threading model, what's verified vs. not, setup gotchas — is in
@@ -34,19 +37,31 @@ python claude_usage_tray.py --statusline-hook
 
 # Test the hook manually
 echo '{"model":{"display_name":"test"},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1782500000}}}' | python claude_usage_tray.py --statusline-hook
+
+# Run as a Claude Code event hook (reads stdin JSON, caches Claude's working state)
+python claude_usage_tray.py --state-hook
+
+# Test the state hook manually (writes usage_tray_state_cache.json)
+echo '{"hook_event_name":"PreToolUse","session_id":"s1"}' | python claude_usage_tray.py --state-hook
 ```
 
 There is no linter configured. There is no build step beyond `pip install -r requirements.txt`; the optional `build_exe.bat` (not in this repo) would produce a PyInstaller `.exe` for the tray icon only.
 
 ## The one fact that matters most
 
-Token/cost data and session/weekly-% data come from **two unrelated
-sources**: local JSONL logs (`~/.claude/projects/`) vs. a cache file
-(`~/.claude/usage_tray_cache.json`) written by the `--statusline-hook`
-mode from data Claude Code itself pipes in. Never assume one can
-substitute for the other, and never assume rate-limit % can be derived
-locally from token counts — it can't; it's account-level server state
-exposed only through the statusLine payload. See ARCHITECTURE.md §2.
+The app surfaces **three unrelated data sources**, none substitutable for
+another:
+1. Token/cost/history — local JSONL logs (`~/.claude/projects/`).
+2. Session/weekly rate-limit % — `~/.claude/usage_tray_cache.json`, written
+   by `--statusline-hook` from data Claude Code pipes in. Rate-limit % is
+   account-level server state, **not** derivable locally from token counts.
+3. Current working state (RAG indicator) — `~/.claude/usage_tray_state_cache.json`,
+   written by `--state-hook` from Claude Code's `hooks` events
+   (Stop/Notification/UserPromptSubmit/PreToolUse). Live per-turn lifecycle
+   state, exposed **only** through the hooks system — the statusLine payload
+   does not carry it.
+
+See ARCHITECTURE.md §2.
 
 ## Non-negotiable constraints (regressions to avoid)
 

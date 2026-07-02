@@ -1525,6 +1525,22 @@ def run_app():
             )
             self.today_label.pack(side="left", fill="x", expand=True)
 
+            # Pin toggle: a small drawn pushpin in the top-right corner
+            # (ARCHITECTURE.md §6 — drawn on a Canvas, never a glyph). It is
+            # hover-revealed, and stays faintly visible while pinned so a locked
+            # widget always advertises that it's locked. Deliberately NOT in the
+            # drag-binding loop below — its own Button-1 toggles the pin and
+            # breaks the event chain so it never starts a window drag.
+            self.pin_canvas = tk.Canvas(
+                today_row, width=self._dot_d, height=self._dot_d,
+                bg=self.BG, highlightthickness=0,
+            )
+            self.pin_canvas.pack(side="right", padx=(6, 0))
+            self.pin_canvas.bind("<Button-1>", self._toggle_pin)
+            self.pin_canvas.bind("<B1-Motion>", lambda e: "break")
+            self.pin_canvas.bind("<ButtonRelease-1>", lambda e: "break")
+            self._pin_drawn = None  # (visible, bright, pinned) of last draw
+
             self.state_label = tk.Label(
                 today_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG, anchor="e",
             )
@@ -1585,6 +1601,7 @@ def run_app():
             self.last_known_pos = (self.root.winfo_x(), self.root.winfo_y())
             self._apply_overlay_styles()    # atomic Win32 layered-overlay setup
             self._set_transparent(True)
+            self._refresh_pin(self._pointer_inside())  # faint pin if starting pinned
             self.root.after(150, self._fast_tick)
             self.root.after(1000, self._tick)
 
@@ -1728,6 +1745,69 @@ def run_app():
                 text=working_state_label(st.get("state"), st.get("updated_at")),
                 fg=(self.DIM if tag == "dim" else WIDGET_COLORS[tag]),
             )
+
+        def _draw_pin(self, *, visible, bright):
+            """Draw the pushpin toggle. Drawn on a Canvas, never a glyph
+            (ARCHITECTURE.md §6). Filled when pinned, outline when not;
+            bright while hovering, dim when only shown because it's pinned."""
+            c = self.pin_canvas
+            c.delete("all")
+            if not visible:
+                return
+            pinned = position_pinned.is_set()
+            color = self.FG if bright else self.DIM
+            d = self._dot_d
+            cx = d / 2
+            # Stem down to the tip, then the round head above it.
+            hr = max(2, d * 0.28)          # head radius
+            head_cy = d * 0.38
+            c.create_line(cx, head_cy, cx, d - 1, fill=color, width=max(1, int(d * 0.14)))
+            if pinned:
+                c.create_oval(cx - hr, head_cy - hr, cx + hr, head_cy + hr,
+                              fill=color, outline="")
+            else:
+                c.create_oval(cx - hr, head_cy - hr, cx + hr, head_cy + hr,
+                              fill="", outline=color, width=max(1, int(d * 0.12)))
+
+        def _refresh_pin(self, inside=None):
+            """Keep the pin's drawn state in sync with hover + pinned state.
+            Only redraws when something actually changed (called every 150ms
+            from _fast_tick). visible = hovering OR pinned; bright = hovering."""
+            pinned = position_pinned.is_set()
+            inside = bool(inside)
+            visible = inside or pinned
+            state = (visible, inside, pinned)
+            if state == self._pin_drawn:
+                return
+            self._pin_drawn = state
+            self._draw_pin(visible=visible, bright=inside)
+
+        def _toggle_pin(self, event=None):
+            """Tk-thread canvas callback — flips the pin lock and persists it.
+            Safe to touch Tk directly here (unlike the tray-thread callbacks).
+            Returns "break" so the toplevel's drag bindings don't also fire."""
+            if position_pinned.is_set():
+                position_pinned.clear()
+                write_usage_cache({"pinned": False}, cache_path=WIDGET_PIN_PATH)
+            else:
+                position_pinned.set()
+                write_usage_cache({"pinned": True}, cache_path=WIDGET_PIN_PATH)
+            self._pin_drawn = None  # force redraw of filled/outline variant
+            self._refresh_pin(self._pointer_inside())
+            return "break"
+
+        def _pointer_inside(self):
+            """True if the mouse pointer is currently over the widget window."""
+            try:
+                mx = self.root.winfo_pointerx()
+                my = self.root.winfo_pointery()
+                wx = self.root.winfo_rootx()
+                wy = self.root.winfo_rooty()
+                ww = self.root.winfo_width()
+                wh = self.root.winfo_height()
+                return wx <= mx < wx + ww and wy <= my < wy + wh
+            except Exception:
+                return False
 
         def _render(self):
             self._draw_status_dot()
@@ -1898,10 +1978,12 @@ def run_app():
             wy = self.root.winfo_rooty()
             ww = self.root.winfo_width()
             wh = self.root.winfo_height()
-            if wx <= mx < wx + ww and wy <= my < wy + wh:
+            inside = wx <= mx < wx + ww and wy <= my < wy + wh
+            if inside:
                 self._set_alpha(191)
             else:
                 self._set_alpha(255, colorkey=True)
+            self._refresh_pin(inside)
 
         def _zorder_vs_taskbar(self):
             """Walk the z-order chain from the top and return our position
@@ -1966,6 +2048,7 @@ def run_app():
                         self._set_alpha(191)
                     else:
                         self._set_alpha(255, colorkey=True)
+                    self._refresh_pin(inside)
                 except Exception:
                     pass
             self.root.after(150, self._fast_tick)
@@ -2116,7 +2199,14 @@ def run_app():
         st_label = working_state_label(st.get("state"), st.get("updated_at"))
         if st_label != "—":
             lines.append(f"State: {st_label}")
-        return "\n".join(lines)
+        # Windows Shell_NotifyIcon's szTip is capped at 128 UTF-16 chars incl.
+        # the NUL terminator (127 usable); pystray raises ValueError past that.
+        # Drop whole trailing lines until it fits — never emit a partial line —
+        # then hard-cap as a final backstop. The dropped info (state) also lives
+        # on the widget dot and in the menu, so nothing is lost outright.
+        while len(lines) > 1 and len("\n".join(lines)) > 127:
+            lines.pop()
+        return "\n".join(lines)[:127]
 
     def menu_items():
         snap = current_snapshot()
@@ -2190,11 +2280,6 @@ def run_app():
             checked=lambda item: ALIGNMENT_CONFIG.enabled,
         ))
         items.append(pystray.MenuItem(
-            "Pin position",
-            on_toggle_pin,
-            checked=lambda item: position_pinned.is_set(),
-        ))
-        items.append(pystray.MenuItem(
             "Run on Windows startup",
             on_toggle_startup,
             checked=lambda item: is_startup_enabled(),
@@ -2232,14 +2317,6 @@ def run_app():
     def on_toggle_alignment(icon, item):
         ALIGNMENT_CONFIG.enabled = not ALIGNMENT_CONFIG.enabled
         write_usage_cache({"enabled": ALIGNMENT_CONFIG.enabled}, cache_path=ALIGNMENT_CONFIG_PATH)
-
-    def on_toggle_pin(icon, item):
-        if position_pinned.is_set():
-            position_pinned.clear()
-            write_usage_cache({"pinned": False}, cache_path=WIDGET_PIN_PATH)
-        else:
-            position_pinned.set()
-            write_usage_cache({"pinned": True}, cache_path=WIDGET_PIN_PATH)
 
     def on_toggle_startup(icon, item):
         # Tray thread. Fails soft -- see set_startup_enabled()/_startup_registry_*.

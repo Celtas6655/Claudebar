@@ -133,6 +133,16 @@ this app. If the cache file doesn't exist or is stale, the UI says so
 explicitly ("Session/weekly %: not available yet — set up the
 statusLine hook") rather than guessing or hiding the absence silently.
 
+**Staleness on read (since 1.2.0)**: the cache is only refreshed when
+Claude Code renders a statusline, so it can be arbitrarily old. All
+display paths (widget bars, tray tooltip, tray menu) go through the pure
+`effective_rate_limits()` helper, which (a) type-coerces every value —
+a corrupted cache degrades to "unavailable", never a crash — and
+(b) nulls a window's percentage once its `resets_at` has passed: the old
+% is definitionally wrong after the window rolls over, and real numbers
+only arrive on the next Claude Code turn. The menu distinguishes that
+case ("awaiting next Claude Code turn") from "hook never ran".
+
 **Practical consequence learned the hard way during setup**: the
 `rate_limits` field is typically empty on the very first statusline
 render of a brand-new or just-cleared session — it only populates after
@@ -156,20 +166,41 @@ lifecycle notifications.
 **How we use it**: `claude_usage_tray.py --state-hook` is a third entry
 point in the same script, registered (auto, on startup) against the
 events in `STATE_HOOK_EVENTS`. The pure function `derive_working_state()`
-maps the incoming `hook_event_name` to one of three states, which the
-hook atomically writes to `~/.claude/usage_tray_state_cache.json`:
+maps the incoming `hook_event_name` to one of three states:
 
 | `hook_event_name` | state | colour |
 |---|---|---|
-| `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | `working` | amber |
+| `UserPromptSubmit`, `PreToolUse` (and `PostToolUse`, see below) | `working` | amber |
 | `Stop` | `done` | green |
 | `Notification` (permission / needs-you) | `waiting` | red |
+| `SessionEnd` | *(removes the session from the cache)* | — |
 | anything else / missing field | *(None — leave last state)* | — |
 
 Returning `None` for an unrecognised or absent event means the hook
 **doesn't overwrite** the cache, so an older Claude Code that omits
 `hook_event_name`, or a future event we don't handle, simply leaves the
 last known state in place rather than blanking it.
+
+`PostToolUse` is deliberately **no longer registered** (since 1.2.0):
+`PreToolUse` alone keeps "working" fresh — every tool start refreshes the
+timestamp, and `Stop` ends the turn — and each registered event costs one
+process spawn per occurrence (see §9 on hook-spawn latency), so dropping
+it halves the per-tool overhead. The mapping keeps `PostToolUse → working`
+so an entry installed by an older version still behaves; `install_state_hooks()`
+actively removes *our own* command from `REMOVED_STATE_HOOK_EVENTS`
+(currently just `PostToolUse`) on its next run, never the user's.
+
+**Per-session cache shape (since 1.2.0)**: the cache is no longer a single
+last-writer-wins slot — with two concurrent Claude Code sessions, a `Stop`
+from one used to turn the dot green while the other was mid-task. The pure
+function `update_state_cache()` maintains one `{state, updated_at}` entry
+per `session_id` under a `"sessions"` map (pruning entries older than
+`STATE_STALE_SECONDS` on every write; `SessionEnd` deletes its session), and
+`aggregate_working_state()` reduces the map with priority
+**waiting > working > done** — red means "needs you" and must win over
+everything. The top-level `state`/`updated_at` keys are still written (the
+write-time aggregate) for compatibility, and `aggregate_working_state()`
+falls back to them when reading a cache written by an older build.
 
 **Staleness**: the reader (`working_state_tag()`) treats any cached state
 older than `STATE_STALE_SECONDS` (5 min) as unknown → a **dim** dot. This
@@ -224,6 +255,13 @@ accident of how it was first written.
 
 This is the part most likely to bite someone making "obvious" changes.
 
+- **One instance only.** `run_app()` first calls
+  `acquire_single_instance_lock()` (a named Win32 mutex via ctypes) and
+  returns quietly when another instance holds it — two instances would
+  fight over TOPMOST every second and race on the sidecar files. Only an
+  explicit `False` stops startup; `None` (non-Windows, or any mutex API
+  failure) never locks the user out. Verified on real Windows: a second
+  launch of the frozen exe exits immediately.
 - **`pystray`'s tray icon runs detached.** `icon.run_detached()` is
   called instead of `icon.run()`. Per pystray's own source
   (`_base.py`), `run_detached()` exists specifically "to allow
@@ -463,6 +501,7 @@ Everything this app reads or writes, and why:
 | `~/.claude/usage_tray_cache.json` | `--statusline-hook` mode | tray menu, floating widget | Session (5h) %, weekly (7d) %, context-window %, reset timestamps. Atomic write (temp file + `os.replace`). |
 | `~/.claude/usage_tray_state_cache.json` | `--state-hook` mode | tray icon (RAG pip), floating widget (RAG dot), tray menu/tooltip | Claude Code's current working state (`working`/`waiting`/`done`) + `updated_at`. Coloured Red/Amber/Green; treated as unknown (dim) past `STATE_STALE_SECONDS`. Atomic write. See §2c. |
 | `~/.claude/usage_tray_state_hooks_installed.json` | `write_state_hooks_marker` (via `ensure_state_hooks_installed`) | tray menu indicator; avoid redundant writes | Marker recording that *we* merged the `--state-hook` entries into `settings.json`'s `hooks` array, and the command we wrote. Separate sidecar, NOT a key in `settings.json`. Same atomic-write shape. |
+| `~/.claude/bin/ClaudeUsageTrayHook.exe` | `install_hook_exe()` (extracted from the frozen main exe's bundle at startup) | Claude Code itself (spawned as the statusLine / state-hook command) | Slim GUI-free build of the same script, so per-turn hook spawns don't pay the full onefile extraction (§9). Content-compared before replacing; replace failure while a hook is running keeps the old copy (fail-soft). Absent when running from source. |
 | `~/.claude/usage_tray_widget_pos.json` | `FloatingWidget._end_drag()` | `FloatingWidget._default_position()` | Remembers where the user dragged the widget, so the taskbar-detection heuristic only applies once, ever. |
 | `~/.claude/usage_tray_widget_favorite_pos.json` | tray menu's "Save current position as favorite" (`on_save_favorite`, via `widget.last_known_pos`) | `FloatingWidget._apply_favorite_position()`; "Load favorite position" menu item's `enabled=` check | User-designated single favorite screen position, independent of the last-dragged position (`usage_tray_widget_pos.json`). Same atomic-write shape. |
 | `~/.claude/settings.json` | the user, or this app's auto-install (`ensure_hook_installed` / `ensure_state_hooks_installed`), or `--install-hook` / `--install-state-hooks` (force) | Claude Code itself | Two things the app manages here: `statusLine.command` (rate-limit data, §2b) and `hooks.<event>[]` entries for `--state-hook` (working state, §2c). On startup it adds its `statusLine` when absent and its `hooks` entries when missing; it only ever **appends** its own hook groups and never removes/edits the user's own `statusLine` or `hooks` (unless the corresponding `--install-*` force flag is used). Writes nothing else — a stray key would break the file's strict parse, §10. |
@@ -517,6 +556,36 @@ advance:
   of a new/cleared session** — populates after the first completed
   response, not before. Don't mistake this for a bug during support
   conversations.
+- **Hook spawns cost real wall-clock time, dominated by PyInstaller
+  onefile self-extraction.** Measured on real Windows hardware
+  (2026-07-03): the full 25 MB main exe takes ~1350 ms per hook
+  invocation; the slim 7 MB `ClaudeUsageTrayHook.exe` (GUI packages
+  excluded) takes ~540–610 ms. That's why the slim helper exists, why it —
+  not the main exe — gets registered as the hook command on frozen
+  installs, and why `PostToolUse` is no longer registered (§2c). Running
+  from source (`python … --statusline-hook`) is faster still. If hook
+  latency ever needs to go lower, the next step is a `--onedir`-style
+  layout for the helper (no per-launch extraction at all).
+- **The whole JSONL history is re-read on every app startup**, and
+  `seen_uuids`/`file_pos` grow in memory with the total number of
+  assistant turns ever logged. Fine at current scale (incremental reads
+  make *steady-state* updates cheap); the known fix, if startup ever gets
+  slow on a huge history, is persisting the aggregates + per-file offsets
+  to a snapshot sidecar and only re-verifying changed files. Deliberately
+  not built yet — it adds real invalidation/corruption edge cases for a
+  problem that hasn't materialised.
+- **`settings.json` updates are read-modify-write with no cross-process
+  lock.** If Claude Code (or anything else) writes settings.json in the
+  same instant as our installer, one side's change is lost. Probability is
+  low — we only write when something actually changed, typically once per
+  install/upgrade — and our write is atomic (temp + `os.replace`), so the
+  file is never *corrupted*, only potentially missing one side's edit
+  until the next startup re-applies ours. Accepted; a robust fix needs
+  file locking across independent programs.
+- **The released exe is not code-signed** (Authenticode needs a paid
+  certificate). Releases ship a `SHA256SUMS.txt` instead, and users should
+  expect a SmartScreen prompt. Signing is the obvious upgrade if this ever
+  distributes more widely (§12).
 - **The "Run on Windows startup" registry toggle's read/write/delete
   logic is unit-tested against a disposable registry subkey (never the
   real `...\CurrentVersion\Run`), and confirmed to actually round-trip on
@@ -607,6 +676,10 @@ Recorded here so they're not lost, not because they're decided:
   the floating widget — this was explicitly considered and explicitly
   deferred in favor of the floating widget for being more flexible
   (full text vs. icon-only); revisit only if specifically requested.
+- Authenticode code-signing for the released exe (needs a paid
+  certificate; releases currently ship SHA256 checksums instead).
+- A persisted aggregates+offsets snapshot so startup doesn't re-read the
+  whole JSONL history (see §9 — deliberately deferred until it hurts).
 
 ## 13. Style conventions to preserve when extending this code
 

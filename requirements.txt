@@ -1,4 +1,8 @@
-pystray>=0.19.5
-Pillow>=10.0.0
-watchdog>=4.0.0
+# Pinned exactly: these versions flow straight into the released exe, so a
+# broken or compromised upstream release must not auto-flow into user builds.
+# Bump deliberately (run --test + a real build), not implicitly.
+# Verified on real Windows hardware 2026-07-03.
+pystray==0.19.5
+Pillow==12.2.0
+watchdog==6.0.0
 # pywin32 is no longer required: taskbar detection now uses ctypes (stdlib).

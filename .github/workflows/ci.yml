@@ -1,8 +1,10 @@
 name: CI
 
 # Runs the test suite on pull requests and on pushes to the long-lived
-# branches. This is the check that branch protection on `master` requires:
-# the job is named `test`, so the required status-check context is `test`.
+# branches. Branch protection on `master` requires the job named `test`, so
+# that job keeps its exact name/context; the Windows leg (`test-windows`) and
+# lint run alongside it (the winreg round-trip and single-instance-mutex tests
+# only exercise for real on Windows).
 #
 # Deliberately GUI-free -- `--test` imports no pystray/Pillow/tkinter and never
 # touches a real ~/.claude, so it runs on a bare runner with no display. The
@@ -19,6 +21,26 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: |
+          python -m pip install ruff==0.14.0
+          python -m ruff check .
+
+      - name: Run test suite
+        run: python claude_usage_tray.py --test
+
+  test-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 

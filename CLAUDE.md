@@ -45,7 +45,7 @@ python claude_usage_tray.py --state-hook
 echo '{"hook_event_name":"PreToolUse","session_id":"s1"}' | python claude_usage_tray.py --state-hook
 ```
 
-There is no linter configured. There is no build step beyond `pip install -r requirements.txt`; the optional `build_exe.bat` (not in this repo) would produce a PyInstaller `.exe` for the tray icon only.
+Linting: `ruff check .` (pinned in CI at the version in `.github/workflows/ci.yml`); keep it clean. Building the exe: `build_exe.bat`, or `pyinstaller ClaudeUsageTrayHook.spec` then `pyinstaller ClaudeUsageTray.spec` — the hook spec MUST run first, the main spec embeds its output (the slim per-turn hook helper, see ARCHITECTURE.md §9 on hook-spawn latency). The two `.spec` files are the canonical build definitions; don't reintroduce ad-hoc pyinstaller command lines.
 
 ## The one fact that matters most
 
@@ -57,9 +57,11 @@ another:
    account-level server state, **not** derivable locally from token counts.
 3. Current working state (RAG indicator) — `~/.claude/usage_tray_state_cache.json`,
    written by `--state-hook` from Claude Code's `hooks` events
-   (Stop/Notification/UserPromptSubmit/PreToolUse). Live per-turn lifecycle
-   state, exposed **only** through the hooks system — the statusLine payload
-   does not carry it.
+   (UserPromptSubmit/PreToolUse/Stop/Notification/SessionEnd). Live per-turn
+   lifecycle state, exposed **only** through the hooks system — the statusLine
+   payload does not carry it. The cache holds one entry per session
+   (`update_state_cache`); readers aggregate with waiting > working > done
+   (`aggregate_working_state`).
 
 See ARCHITECTURE.md §2.
 

@@ -23,27 +23,33 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt pyinstaller
+        # pyinstaller pinned for the same reason requirements.txt is: released
+        # exes must not silently absorb a new upstream build toolchain.
+        run: python -m pip install -r requirements.txt pyinstaller==6.21.0
 
       - name: Run test suite (gate)
         run: python claude_usage_tray.py --test
 
-      - name: Build exe
+      - name: Build exes (slim hook exe first — the main spec embeds it)
         run: |
           python generate_icon.py
-          pyinstaller --onefile --noconsole --icon=icon.ico --name ClaudeUsageTray --collect-all pystray --collect-all watchdog claude_usage_tray.py
+          pyinstaller ClaudeUsageTrayHook.spec
+          pyinstaller ClaudeUsageTray.spec
 
-      - name: Smoke-test the statusline hook from the exe (gate)
+      - name: Smoke-test the statusline hook from both exes (gate)
         shell: cmd
         # A --noconsole (GUI-subsystem) exe only exposes stdin/stdout when the
         # parent redirects them via handles -- which cmd file-redirection and
         # Claude Code's own spawn both do, but a PowerShell pipe does NOT. So
         # this gate MUST use cmd redirection, or it would spuriously "fail".
         run: |
-          echo {"model":{"display_name":"test"},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1782500000}}}> payload.json
+          echo {"model":{"display_name":"test"},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":4102444800}}}> payload.json
           dist\ClaudeUsageTray.exe --statusline-hook < payload.json > hookout.txt
           type hookout.txt
-          findstr /C:"test | 5h 50%" hookout.txt || (echo HOOK SMOKE TEST FAILED & exit /b 1)
+          findstr /C:"test | 5h 50%" hookout.txt || (echo MAIN EXE HOOK SMOKE TEST FAILED & exit /b 1)
+          dist\ClaudeUsageTrayHook.exe --statusline-hook < payload.json > hookout2.txt
+          type hookout2.txt
+          findstr /C:"test | 5h 50%" hookout2.txt || (echo SLIM HOOK EXE SMOKE TEST FAILED & exit /b 1)
 
       - name: Read version
         id: ver
@@ -61,6 +67,9 @@ jobs:
             echo "Release $tag already exists — nothing to publish."
             exit 0
           fi
-          gh release create "$tag" dist/ClaudeUsageTray.exe \
+          # Checksums so downloads are verifiable (the exe is not code-signed).
+          (cd dist && sha256sum ClaudeUsageTray.exe) > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release create "$tag" dist/ClaudeUsageTray.exe SHA256SUMS.txt \
             --title "$tag" \
-            --notes "Standalone Windows executable for the Claude Code usage tray. No Python required — download \`ClaudeUsageTray.exe\`, run it, and it wires up the statusLine hook automatically (restart Claude Code once)."
+            --notes "Standalone Windows executable for the Claude Code usage tray. No Python required — download \`ClaudeUsageTray.exe\`, run it, and it wires up the statusLine hook automatically (restart Claude Code once). Verify the download against \`SHA256SUMS.txt\`."

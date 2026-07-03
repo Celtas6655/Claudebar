@@ -36,15 +36,26 @@ hover/right-click. *(Drop a real screenshot here once you have one.)*
 
 1. Grab **`ClaudeUsageTray.exe`** from the
    [latest release](https://github.com/Celtas6655/claudebar-usage/releases/latest).
+   Each release also ships a `SHA256SUMS.txt` you can verify the download
+   against (`Get-FileHash ClaudeUsageTray.exe` in PowerShell) — the exe isn't
+   code-signed, so expect a SmartScreen prompt on first run.
 2. Double-click it. That's it — a tray icon and floating widget appear, and the
    app **wires up the statusLine hook for you automatically** (it adds the entry
-   to `~/.claude/settings.json` only if you don't already have a `statusLine`).
+   to `~/.claude/settings.json` only if you don't already have a `statusLine`,
+   or upgrades an entry a previous version of this app wrote).
 3. **Restart Claude Code once** so it starts sending session/weekly % data.
 
 One self-contained file handles everything — the tray app, the statusLine hook,
 and the auto-install. Nothing to install, no Python required. Put it wherever you
 like (and see [Run it automatically when Windows starts](#run-it-automatically-when-windows-starts)
 to launch it at login).
+
+> On startup the exe also extracts a small helper, `ClaudeUsageTrayHook.exe`,
+> to `~/.claude/bin/` and registers *that* as the hook command. It's the same
+> program minus the GUI packages, so the hooks Claude Code spawns on every turn
+> start in well under half the time of the full exe. If the helper can't be
+> extracted for any reason, the app quietly registers itself instead —
+> everything still works, just a bit slower per turn.
 
 ### Alternative: run from source (needs Python)
 
@@ -164,6 +175,11 @@ filesystem watcher reacts directly rather than checking on a timer (measured at
 writes a fresh cache, which happens on every Claude Code turn. A slower full
 rescan every 30 seconds runs only as a safety net.
 
+Once a rate-limit window's reset time passes, its old percentage is no longer
+shown (it's definitionally out of date) — the bar reads `--` and the menu says
+"awaiting next Claude Code turn" until Claude Code sends fresh numbers on your
+next turn.
+
 ## Working-state indicator (Red/Amber/Green)
 
 The widget shows a coloured dot (and the tray icon a matching corner pip) for
@@ -179,11 +195,17 @@ what Claude Code is doing **right now**:
 This can't be derived from the token logs — it's Claude Code's live per-turn
 lifecycle, which only its **event hooks** expose. So the app registers a tiny
 `--state-hook` command against a handful of events (`UserPromptSubmit`,
-`PreToolUse`, `PostToolUse`, `Stop`, `Notification`) in
+`PreToolUse`, `Stop`, `Notification`, `SessionEnd`) in
 `~/.claude/settings.json`. **This is auto-installed on startup**, the same way
-the statusLine hook is: the app only ever *adds* its own entries and never
-removes or edits any hooks you configured yourself. Restart Claude Code once
-after first launch for the events to start firing.
+the statusLine hook is: the app only ever *adds or upgrades its own entries* and
+never removes or edits any hooks you configured yourself. Restart Claude Code
+once after first launch for the events to start firing.
+
+Running **several Claude Code sessions at once**? The indicator tracks each
+session separately and shows the most attention-worthy state across them: red
+("needs you") beats amber ("working"), which beats green ("done") — so one
+terminal finishing can't hide another one that's still busy. Closing a session
+removes it from the aggregate.
 
 **To turn it off**, remove the entries whose command ends in `--state-hook` from
 the `hooks` section of `~/.claude/settings.json`. Note the app re-adds them on
@@ -232,20 +254,23 @@ Releases are built automatically by GitHub Actions
 smoke-test as gates, and publishes a release tagged from the `VERSION` file. To
 cut a new version, bump `VERSION` and merge to `master`.
 
-To build one locally:
+To build one locally (or just run `build_exe.bat`, which does exactly this):
 
 ```bash
 pip install pyinstaller
 python generate_icon.py
-pyinstaller --onefile --noconsole --icon=icon.ico --name ClaudeUsageTray \
-    --collect-all pystray --collect-all watchdog claude_usage_tray.py
+pyinstaller ClaudeUsageTrayHook.spec   # slim hook helper first…
+pyinstaller ClaudeUsageTray.spec       # …then the main exe, which embeds it
 ```
 
-The result is `dist/ClaudeUsageTray.exe` — a single self-contained file that runs
-the tray app, the statusLine hook, and the auto-install, with no Python needed.
-The `--icon=icon.ico` flag stamps the app's usage-gauge icon onto the `.exe`
-(the tray icon itself is drawn by Pillow at runtime, but the file/taskbar icon is
-baked in at build time, so it needs a real `.ico` on disk).
+The two `.spec` files are the canonical build definitions (same ones the release
+workflow runs). The hook spec builds `ClaudeUsageTrayHook.exe` — the same script
+with the GUI packages excluded, several times smaller so Claude Code's per-turn
+hook spawns are fast — and the main spec embeds it into
+`dist/ClaudeUsageTray.exe`, a single self-contained file that runs the tray app,
+the hooks, and the auto-install, with no Python needed. The icon is baked in at
+build time (the tray icon itself is drawn by Pillow at runtime), so
+`generate_icon.py` needs to have produced a real `icon.ico` on disk first.
 
 > Testing the hook on a freshly built exe: use `cmd` redirection
 > (`ClaudeUsageTray.exe --statusline-hook < payload.json > out.txt`), **not** a
@@ -278,8 +303,9 @@ Prefer not to touch the registry? The manual alternative works too: press
 
 There's a small price table near the top of `claude_usage_tray.py`
 (`PRICES_PER_MILLION`, USD per million tokens, for input / output / cache-write /
-cache-read across the Opus / Sonnet / Haiku tiers). These rates change over time
-and aren't wired to any live source — if the numbers look off, check
+cache-read across the Opus / Sonnet / Haiku tiers), snapshotted as of the date in
+`PRICES_AS_OF` (also shown in the tray menu). These rates change over time and
+aren't wired to any live source — if the numbers look off, check
 https://platform.claude.com/docs/en/about-claude/pricing and update the dict.
 
 ## Running the test suite
@@ -303,9 +329,12 @@ filesystem-watcher latency.
 |---|---|
 | `claude_usage_tray.py` | The entire app — tray, widget, tracker, statusLine hook, working-state event hook, hook auto-install, tests. Deliberately single-file. |
 | `generate_icon.py` | Generates `icon.ico` for the PyInstaller build. |
-| `requirements.txt` | Runtime dependencies. |
-| `VERSION` | Single source of truth for the release version; the workflow tags from it. |
-| `.github/workflows/release.yml` | Builds the exe on push to `master` and publishes a GitHub release. |
+| `requirements.txt` | Runtime dependencies (pinned exactly — they flow into released exes). |
+| `ClaudeUsageTray.spec` / `ClaudeUsageTrayHook.spec` | Canonical PyInstaller build definitions (main exe + slim hook helper). |
+| `build_exe.bat` | Local build convenience wrapper around the two specs. |
+| `VERSION` | Single source of truth for the release version (checked against `__version__` by `--test`); the workflow tags from it. |
+| `.github/workflows/release.yml` | Builds both exes on push to `master`, smoke-tests the hooks, and publishes a GitHub release with checksums. |
+| `.github/workflows/ci.yml` | Lint (`ruff`) + test suite on Ubuntu and Windows for PRs and pushes. |
 | `ARCHITECTURE.md` | Deep design & decision history — the three data sources, threading model, two bug postmortems, what's verified vs. not. **Read this before any architectural change.** |
 | `CLAUDE.md` | Short index / guidance for AI agents working in this repo. |
 

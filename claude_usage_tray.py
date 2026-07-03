@@ -93,16 +93,25 @@ STATE_STALE_SECONDS = 300
 # Claude Code hook events we register --state-hook against, and the working state
 # each maps to. Order/keys mirror derive_working_state()'s logic; used both to
 # install the hooks and to reason about them. Notification == "Claude needs you".
-STATE_HOOK_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "Notification")
+# PostToolUse is deliberately NOT registered: PreToolUse alone keeps "working"
+# fresh (every tool start refreshes it, Stop ends the turn), and each registered
+# event costs one process spawn per occurrence — on a frozen onefile build that
+# is a full self-extraction, so halving the per-tool spawns matters.
+STATE_HOOK_EVENTS = ("UserPromptSubmit", "PreToolUse", "Stop", "Notification", "SessionEnd")
+
+# Events we used to register but no longer do. install_state_hooks() removes
+# OUR OWN command from these on its next run (never the user's own hooks).
+REMOVED_STATE_HOOK_EVENTS = ("PostToolUse",)
 
 # App version -- single source of truth, mirrored by the VERSION file at the
 # repo root that the release workflow reads to tag the build.
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Approximate USD price per 1M tokens: (input, output, cache_write, cache_read)
-# Anthropic's published per-model rates as of mid-2026 -- treat as a rough
+# Anthropic's published per-model rates as of PRICES_AS_OF -- treat as a rough
 # estimate and check https://platform.claude.com/docs/en/about-claude/pricing
 # if you need exact numbers; rates do change over time.
+PRICES_AS_OF = "mid-2026"
 PRICES_PER_MILLION = {
     "opus":   (5.00, 25.00, 6.25, 0.50),
     "sonnet": (3.00, 15.00, 3.75, 0.30),
@@ -116,6 +125,34 @@ USAGE_KEYS = (
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
 )
+
+
+def _as_number(value):
+    """value as a float when it's a real number (bools excluded), else None.
+    Used to sanitise externally-written cache/payload fields before they reach
+    formatting or comparison code — a corrupted cache file must degrade to
+    "unavailable", never crash a render loop."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def record_local_date(ts):
+    """Local calendar date for an ISO-8601 timestamp string, or None.
+
+    Claude Code's JSONL timestamps are UTC ("2026-06-26T10:15:00.000Z");
+    comparing their date *prefix* against the local date misattributes
+    anything logged between local midnight and UTC midnight. Parse and
+    convert to the local zone before taking the date."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().date()
 
 
 def price_for_model(model_name):
@@ -209,14 +246,16 @@ class UsageTracker:
         }
 
     def _apply(self, record):
-        self.sessions.add(record.get("session_id"))
+        session_id = record.get("session_id")
+        if session_id:
+            self.sessions.add(session_id)
         for key in USAGE_KEYS:
             self.totals[key] += record[key]
             self.by_model[record["model"]][key] += record[key]
             self.by_project[record["project"]][key] += record[key]
         cost = cost_for_record(record)
         self.cost_total += cost
-        if record["timestamp"][:10] == self._today.isoformat():
+        if record_local_date(record["timestamp"]) == self._today:
             for key in USAGE_KEYS:
                 self.today_totals[key] += record[key]
             self.cost_today += cost
@@ -248,10 +287,16 @@ class UsageTracker:
         for record in new_records:
             self._apply(record)
 
-    def poll(self):
-        """Full sweep: read any new lines appended to ANY session file."""
+    def poll(self, files=None):
+        """Full sweep: read any new lines appended to ANY session file.
+
+        `files` lets a caller pre-scan the tree with find_session_files()
+        *outside* whatever lock guards this tracker — the walk is the slow
+        part on a big history; the incremental per-file reads are cheap."""
         self._maybe_roll_day()
-        for filepath in find_session_files(self.projects_dir):
+        if files is None:
+            files = find_session_files(self.projects_dir)
+        for filepath in files:
             self.poll_file(filepath)
 
     def snapshot(self):
@@ -318,7 +363,9 @@ def fmt_reset_full(ts):
 
 
 def pct_tag(pct):
-    """Color-threshold name for a percentage: green < 50, yellow < 80, else red."""
+    """Color-threshold name for a percentage: green < 50, yellow < 80, else red.
+    Non-numeric input (a corrupted cache value) degrades to "dim", never raises."""
+    pct = _as_number(pct)
     if pct is None:
         return "dim"
     if pct < 50:
@@ -326,6 +373,40 @@ def pct_tag(pct):
     if pct < 80:
         return "yellow"
     return "red"
+
+
+def effective_rate_limits(cache, now=None):
+    """Sanitised, display-ready view of the statusline rate-limit cache.
+
+    The cache is only refreshed when Claude Code renders a statusline, so it
+    can be arbitrarily old. Two rules keep stale data from being shown as
+    current:
+      - every percentage / timestamp is coerced through _as_number() (a
+        corrupted or hand-edited cache degrades to "unavailable", not a crash);
+      - once a window's `resets_at` has passed, its percentage is
+        definitionally wrong (the window rolled over) — both fields are nulled
+        until the next Claude Code turn writes fresh numbers.
+
+    Returns {"model", "context_pct", "session_pct", "session_resets_at",
+    "weekly_pct", "weekly_resets_at"} with None for anything unavailable."""
+    cache = cache if isinstance(cache, dict) else {}
+    now = time.time() if now is None else now
+    model = cache.get("model")
+    out = {
+        "model": model if isinstance(model, str) else None,
+        "context_pct": _as_number(cache.get("context_used_percentage")),
+    }
+    for prefix, pct_key, reset_key in (
+        ("session", "session_used_percentage", "session_resets_at"),
+        ("weekly", "weekly_used_percentage", "weekly_resets_at"),
+    ):
+        pct = _as_number(cache.get(pct_key))
+        resets_at = _as_number(cache.get(reset_key))
+        if resets_at is not None and resets_at <= now:
+            pct, resets_at = None, None
+        out[prefix + "_pct"] = pct
+        out[prefix + "_resets_at"] = resets_at
+    return out
 
 
 # Map an abstract working state to a WIDGET_COLORS key. RAG semantics (locked
@@ -358,6 +439,95 @@ def working_state_label(state, updated_at=None, now=None):
     if working_state_tag(state, updated_at, now) == "dim":
         return "—"
     return STATE_LABELS[state]
+
+
+# When several Claude Code sessions are live at once, the indicator shows the
+# most attention-worthy state across them: red ("needs you") must win over
+# amber ("working"), which wins over green ("done").
+_STATE_PRIORITY = ("waiting", "working", "done")
+
+
+def aggregate_working_state(cache, now=None):
+    """(state, updated_at) across all live sessions in a state-cache dict.
+
+    The cache's "sessions" map (see update_state_cache) holds one
+    {state, updated_at} entry per Claude Code session; entries older than
+    STATE_STALE_SECONDS are ignored. Priority across fresh entries is
+    waiting > working > done. A cache without a sessions map (written by an
+    older build) falls back to its legacy top-level state/updated_at fields.
+    Returns (None, None) when nothing fresh is known."""
+    now = time.time() if now is None else now
+    cache = cache if isinstance(cache, dict) else {}
+    sessions = cache.get("sessions")
+    if not isinstance(sessions, dict):
+        state = cache.get("state")
+        ts = _as_number(cache.get("updated_at"))
+        if state in STATE_TAGS and (ts is None or now - ts <= STATE_STALE_SECONDS):
+            return state, ts
+        return None, None
+    freshest = {}
+    for entry in sessions.values():
+        if not isinstance(entry, dict):
+            continue
+        state = entry.get("state")
+        ts = _as_number(entry.get("updated_at"))
+        if state not in STATE_TAGS or ts is None or now - ts > STATE_STALE_SECONDS:
+            continue
+        if state not in freshest or ts > freshest[state]:
+            freshest[state] = ts
+    for state in _STATE_PRIORITY:
+        if state in freshest:
+            return state, freshest[state]
+    return None, None
+
+
+def update_state_cache(cache, payload, now=None):
+    """Pure: fold one Claude Code hook payload into the state-cache dict.
+
+    Keeps one entry per session_id in cache["sessions"] so concurrent Claude
+    Code sessions can't clobber each other's state (a Stop in one terminal no
+    longer turns the dot green while another session is mid-task). Stale
+    entries are pruned on every write; SessionEnd removes its session outright
+    (no live session -> dim, not a lingering green/red). The top-level
+    state/updated_at fields are kept as the write-time aggregate for
+    compatibility with anything reading the old single-slot shape.
+
+    Returns the new cache dict, or None when the event carries no state
+    transition (leave the file untouched, same contract as before)."""
+    now = time.time() if now is None else now
+    payload = payload if isinstance(payload, dict) else {}
+    event = payload.get("hook_event_name")
+    state = derive_working_state(payload)
+    ended = event == "SessionEnd"
+    if state is None and not ended:
+        return None
+
+    sessions = {}
+    old = (cache if isinstance(cache, dict) else {}).get("sessions")
+    if isinstance(old, dict):
+        for sid, entry in old.items():
+            if not isinstance(entry, dict):
+                continue
+            ts = _as_number(entry.get("updated_at"))
+            if ts is None or now - ts > STATE_STALE_SECONDS:
+                continue
+            if entry.get("state") in STATE_TAGS:
+                sessions[sid] = {"state": entry["state"], "updated_at": ts}
+
+    session_id = payload.get("session_id") or "unknown"
+    if ended:
+        sessions.pop(session_id, None)
+    else:
+        sessions[session_id] = {"state": state, "updated_at": now}
+
+    agg_state, agg_ts = aggregate_working_state({"sessions": sessions}, now)
+    return {
+        "sessions": sessions,
+        "state": agg_state,
+        "event": event,
+        "session_id": payload.get("session_id"),
+        "updated_at": agg_ts if agg_ts is not None else now,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -759,6 +929,70 @@ def find_tray_notification_rect():
     return {"left": tray[0], "top": tb[1], "height": tb[3] - tb[1]}
 
 
+def clamp_position(x, y, w, h, bounds):
+    """Clamp a w×h window's top-left corner so it stays inside bounds
+    (left, top, right, bottom). Pure — used to keep a remembered widget
+    position on screen after a monitor is removed or the resolution shrinks
+    (an overrideredirect window parked off-screen is otherwise unrecoverable
+    without the tray menu)."""
+    left, top, right, bottom = bounds
+    x = max(left, min(int(x), right - int(w)))
+    y = max(top, min(int(y), bottom - int(h)))
+    return x, y
+
+
+def virtual_screen_bounds():
+    """(left, top, right, bottom) of the Windows virtual screen — the bounding
+    box of ALL monitors — in physical pixels, or None off-Windows / on failure.
+    Same lazy-ctypes, fail-soft pattern as the taskbar helpers above."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        left = user32.GetSystemMetrics(76)    # SM_XVIRTUALSCREEN
+        top = user32.GetSystemMetrics(77)     # SM_YVIRTUALSCREEN
+        width = user32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        height = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        if width <= 0 or height <= 0:
+            return None
+        return (left, top, left + width, top + height)
+    except Exception:
+        return None
+
+
+# Handle of the single-instance mutex, kept alive for the process lifetime
+# (releasing it would let a second instance start).
+_single_instance_handle = None
+
+
+def acquire_single_instance_lock(name="Local\\ClaudeUsageTray-single-instance"):
+    """Try to become the one running instance (named Win32 mutex).
+
+    Returns True when acquired, False when another instance already holds it,
+    None when unsupported (non-Windows) or on any failure — callers treat
+    only an explicit False as "don't start", so a broken mutex API can never
+    lock the user out of their own app. Two instances fighting over TOPMOST
+    every second and racing on the sidecar files is the failure this guards
+    against (e.g. Windows-startup entry + a manual launch)."""
+    global _single_instance_handle
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return None
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(handle)
+            return False
+        _single_instance_handle = handle
+        return True
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------
 # Windows startup registration: HKCU\...\CurrentVersion\Run entry.
 # Uses winreg (stdlib) only -- imported lazily and only on Windows, same
@@ -928,21 +1162,32 @@ def set_startup_enabled(enabled, value_name=None, subkey=None, hive=None,
 
 def process_statusline_payload(payload):
     """Pure function: turns one statusLine JSON payload into (cache_dict,
-    status_line_text). Kept separate from stdin/file I/O so it's testable."""
-    model = (payload.get("model") or {}).get("display_name", "Claude")
-    ctx = payload.get("context_window") or {}
-    rate_limits = payload.get("rate_limits") or {}
-    five_hour = rate_limits.get("five_hour") or {}
-    seven_day = rate_limits.get("seven_day") or {}
+    status_line_text). Kept separate from stdin/file I/O so it's testable.
+
+    Every field is type-guarded (_as_number / isinstance): the payload is
+    external input, and one non-numeric percentage must not crash the hook
+    (which would blank the user's statusline every turn)."""
+    payload = payload if isinstance(payload, dict) else {}
+
+    def _dict(value):
+        return value if isinstance(value, dict) else {}
+
+    model = _dict(payload.get("model")).get("display_name")
+    if not isinstance(model, str) or not model:
+        model = "Claude"
+    ctx = _dict(payload.get("context_window"))
+    rate_limits = _dict(payload.get("rate_limits"))
+    five_hour = _dict(rate_limits.get("five_hour"))
+    seven_day = _dict(rate_limits.get("seven_day"))
 
     cache = {
         "fetched_at": time.time(),
         "model": model,
-        "context_used_percentage": ctx.get("used_percentage"),
-        "session_used_percentage": five_hour.get("used_percentage"),
-        "session_resets_at": five_hour.get("resets_at"),
-        "weekly_used_percentage": seven_day.get("used_percentage"),
-        "weekly_resets_at": seven_day.get("resets_at"),
+        "context_used_percentage": _as_number(ctx.get("used_percentage")),
+        "session_used_percentage": _as_number(five_hour.get("used_percentage")),
+        "session_resets_at": _as_number(five_hour.get("resets_at")),
+        "weekly_used_percentage": _as_number(seven_day.get("used_percentage")),
+        "weekly_resets_at": _as_number(seven_day.get("resets_at")),
     }
 
     parts = [model]
@@ -1000,6 +1245,19 @@ def read_usage_cache(cache_path=None):
         return None
 
 
+def _is_our_statusline_command(command):
+    """True when a statusLine command string is "ours-shaped" — i.e. it ends
+    in this app's --statusline-hook flag, so it was written by some (possibly
+    older, possibly differently-pathed) install of this app and is safe to
+    upgrade in place. A genuinely foreign command never carries our flag."""
+    return isinstance(command, str) and command.rstrip().endswith("--statusline-hook")
+
+
+def _is_our_state_command(command):
+    """Mirror of _is_our_statusline_command for --state-hook entries."""
+    return isinstance(command, str) and command.rstrip().endswith("--state-hook")
+
+
 def install_statusline_hook(settings_path, command, force=True):
     """Merge the statusLine hook entry into Claude Code's settings.json.
 
@@ -1007,8 +1265,10 @@ def install_statusline_hook(settings_path, command, force=True):
 
     force=True  -> always (re)write our entry, even over a different existing
                    statusLine command (the --install-hook escape hatch).
-    force=False -> only add our entry when there's NO statusLine at all; never
-                   clobber a user's own/foreign statusLine (the auto path).
+    force=False -> add our entry when there's NO statusLine at all, or upgrade
+                   in place when the existing one is ours-shaped (ends in
+                   --statusline-hook — e.g. an older install path); never
+                   clobber a genuinely foreign statusLine (the auto path).
 
     Returns (success: bool, message: str). Never touches the file if it can't
     be parsed cleanly — safer than risking a corrupt settings.json (one stray
@@ -1034,7 +1294,8 @@ def install_statusline_hook(settings_path, command, force=True):
     if existing == desired:
         return True, "statusLine hook already configured — nothing to change."
 
-    if existing is not None and not force:
+    existing_command = existing.get("command") if isinstance(existing, dict) else None
+    if existing is not None and not force and not _is_our_statusline_command(existing_command):
         return True, (
             "Left the existing statusLine untouched:\n"
             f"  {json.dumps(existing)}\n"
@@ -1106,10 +1367,77 @@ def ensure_hook_installed(settings_path, command, marker_path, force=False):
     return success, message
 
 
+# ---------------------------------------------------------------------------
+# Slim companion hook exe. A PyInstaller --onefile build self-extracts its
+# whole bundle (Pillow/pystray/watchdog/tkinter) on EVERY launch — and Claude
+# Code launches the hook command on every statusline render and every
+# registered lifecycle event, PreToolUse included (which is blocking). So the
+# release build also produces ClaudeUsageTrayHook.exe: the same script, GUI
+# packages excluded, several times smaller and correspondingly faster to
+# extract. It is bundled INSIDE the main exe (single-file download preserved),
+# extracted to ~/.claude/bin/ at startup, and registered as the hook command.
+# Every step fails soft back to registering the main exe itself.
+# ---------------------------------------------------------------------------
+
+HOOK_EXE_NAME = "ClaudeUsageTrayHook.exe"
+HOOK_EXE_INSTALL_DIR = os.path.join(CLAUDE_HOME, "bin")
+
+
+def _bundled_hook_exe_path():
+    """Path of the slim hook exe inside the frozen onefile bundle, or None
+    (not frozen, or this build doesn't carry one)."""
+    if not getattr(sys, "frozen", False):
+        return None
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return None
+    path = os.path.join(base, HOOK_EXE_NAME)
+    return path if os.path.isfile(path) else None
+
+
+def install_hook_exe(bundled_path=None, dest_dir=None):
+    """Copy the bundled slim hook exe to ~/.claude/bin (atomic, and only when
+    the bytes actually differ, so a normal startup is one read + compare).
+
+    Returns the installed exe's path, or None when there's nothing to install
+    or installation failed with no previous copy present — callers then fall
+    back to registering the main exe itself. If a previous copy exists but
+    can't be replaced (e.g. a hook process is executing it right now,
+    sharing-violation on os.replace), the previous copy's path is returned:
+    an older hook that works beats no hook."""
+    bundled_path = bundled_path or _bundled_hook_exe_path()
+    if not bundled_path:
+        return None
+    dest_dir = dest_dir or HOOK_EXE_INSTALL_DIR
+    dest = os.path.join(dest_dir, HOOK_EXE_NAME)
+    try:
+        with open(bundled_path, "rb") as f:
+            data = f.read()
+        try:
+            with open(dest, "rb") as f:
+                if f.read() == data:
+                    return dest
+        except OSError:
+            pass
+        os.makedirs(dest_dir, exist_ok=True)
+        tmp = dest + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+        return dest
+    except OSError:
+        return dest if os.path.isfile(dest) else None
+
+
 def _resolve_hook_command():
-    """The statusLine command line for the current process (frozen exe or
-    plain python), via build_hook_command."""
+    """The statusLine command line for the current process: the slim installed
+    hook exe when running frozen (see install_hook_exe), else the main
+    exe / plain-python form via build_hook_command."""
     frozen = getattr(sys, "frozen", False)
+    if frozen:
+        hook_exe = install_hook_exe()
+        if hook_exe:
+            return f'"{hook_exe}" --statusline-hook'
     return build_hook_command(frozen, sys.executable, os.path.abspath(__file__))
 
 
@@ -1132,9 +1460,17 @@ def install_state_hooks(settings_path, command, force=False):
     for each event in STATE_HOOK_EVENTS.
 
     Non-destructive and idempotent: for each event we append a matcher group
-    pointing at `command` only when that exact command isn't already registered
-    there; we never remove or edit the user's own hook groups. Writes only when
-    something actually changed, so a normal startup doesn't churn settings.json.
+    pointing at `command` only when it isn't already registered there; we never
+    remove or edit the user's own hook groups. Writes only when something
+    actually changed, so a normal startup doesn't churn settings.json.
+
+    Two kinds of *our own* entries are also maintained (never the user's):
+      - an ours-shaped command (ends in --state-hook, see
+        _is_our_state_command) that differs from `command` — e.g. written by
+        an older install at a different path — is upgraded in place rather
+        than left to run alongside a freshly-appended duplicate;
+      - our command is removed from events in REMOVED_STATE_HOOK_EVENTS
+        (events we used to register but no longer do, e.g. PostToolUse).
 
     Refuses to touch the file if it exists but won't parse — a corrupt
     settings.json is worse than a missing indicator (one stray comma kills the
@@ -1163,25 +1499,61 @@ def install_state_hooks(settings_path, command, force=False):
     if not isinstance(hooks, dict):
         hooks = {}
 
-    def _command_present(groups):
-        for group in groups:
-            if not isinstance(group, dict):
-                continue
-            for h in group.get("hooks") or []:
-                if isinstance(h, dict) and h.get("command") == command:
-                    return True
-        return False
-
     changed = False
+
     for event in STATE_HOOK_EVENTS:
         groups = hooks.get(event)
         if not isinstance(groups, list):
             groups = []
-        if _command_present(groups):
+        present = False
+        new_groups = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                new_groups.append(group)
+                continue
+            inner = []
+            for h in group["hooks"]:
+                if isinstance(h, dict) and _is_our_state_command(h.get("command")):
+                    if present:
+                        changed = True   # a duplicate of ours -- drop it
+                        continue
+                    if h.get("command") != command:
+                        h = dict(h, command=command)   # upgrade ours in place
+                        changed = True
+                    present = True
+                inner.append(h)
+            if inner != group["hooks"]:
+                group = dict(group, hooks=inner)
+            if not inner and set(group.keys()) <= {"matcher", "hooks"}:
+                changed = True           # a group of ours emptied out -- drop it
+                continue
+            new_groups.append(group)
+        if not present:
+            new_groups.append({"matcher": "", "hooks": [dict(entry)]})
+            changed = True
+        hooks[event] = new_groups
+
+    # Retire OUR command from events we no longer register. User hooks on
+    # these events are untouched.
+    for event in REMOVED_STATE_HOOK_EVENTS:
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
             continue
-        groups.append({"matcher": "", "hooks": [dict(entry)]})
-        hooks[event] = groups
-        changed = True
+        new_groups = []
+        for group in groups:
+            if isinstance(group, dict) and isinstance(group.get("hooks"), list):
+                inner = [h for h in group["hooks"]
+                         if not (isinstance(h, dict) and _is_our_state_command(h.get("command")))]
+                if len(inner) != len(group["hooks"]):
+                    changed = True
+                    if not inner and set(group.keys()) <= {"matcher", "hooks"}:
+                        continue
+                    group = dict(group, hooks=inner)
+            new_groups.append(group)
+        if new_groups:
+            hooks[event] = new_groups
+        else:
+            hooks.pop(event, None)
 
     if not changed:
         return True, "working-state hooks already configured — nothing to change."
@@ -1259,9 +1631,14 @@ def ensure_state_hooks_installed(settings_path, command, marker_path, force=Fals
 
 
 def _resolve_state_hook_command():
-    """The --state-hook command line for the current process (frozen exe or
-    plain python), via build_state_hook_command."""
+    """The --state-hook command line for the current process: the slim
+    installed hook exe when running frozen (see install_hook_exe), else the
+    main exe / plain-python form via build_state_hook_command."""
     frozen = getattr(sys, "frozen", False)
+    if frozen:
+        hook_exe = install_hook_exe()
+        if hook_exe:
+            return f'"{hook_exe}" --state-hook'
     return build_state_hook_command(frozen, sys.executable, os.path.abspath(__file__))
 
 
@@ -1344,8 +1721,13 @@ def run_statusline_hook():
         payload = json.loads(_read_hook_stdin().decode("utf-8", "replace"))
     except (json.JSONDecodeError, ValueError):
         payload = {}
-    cache, status_line_text = process_statusline_payload(payload)
-    write_usage_cache(cache)
+    try:
+        cache, status_line_text = process_statusline_payload(payload)
+        write_usage_cache(cache)
+    except Exception:
+        # Whatever happens, print SOMETHING back — an empty/erroring
+        # statusline command blanks the user's terminal status every turn.
+        status_line_text = "Claude"
     _write_hook_stdout(status_line_text)
 
 
@@ -1364,17 +1746,14 @@ def run_state_hook():
     except (json.JSONDecodeError, ValueError):
         payload = {}
     try:
-        state = derive_working_state(payload)
-        if state is not None:
-            write_usage_cache(
-                {
-                    "state": state,
-                    "event": payload.get("hook_event_name"),
-                    "session_id": payload.get("session_id"),
-                    "updated_at": time.time(),
-                },
-                cache_path=STATE_CACHE_PATH,
-            )
+        # Read-modify-write of the per-session map (see update_state_cache).
+        # Two hook processes racing is last-writer-wins, same as the old
+        # single-slot shape — acceptable, the next event corrects it.
+        new_cache = update_state_cache(
+            read_usage_cache(cache_path=STATE_CACHE_PATH), payload,
+        )
+        if new_cache is not None:
+            write_usage_cache(new_cache, cache_path=STATE_CACHE_PATH)
     except Exception:
         pass
 
@@ -1386,6 +1765,12 @@ def run_state_hook():
 # --------------------------------------------------------------------------
 
 def run_app():
+    # Two live instances fight over TOPMOST every second and race on the
+    # sidecar files — bail quietly if one is already running. Only an explicit
+    # False stops us; None (non-Windows / mutex failure) never locks the user out.
+    if acquire_single_instance_lock() is False:
+        return
+
     import pystray
     import tkinter as tk
     from PIL import Image, ImageDraw
@@ -1452,10 +1837,13 @@ def run_app():
 
     def current_state_tag():
         """WIDGET_COLORS key for Claude's current working state, read fresh from
-        the state cache (dim when unknown/stale). Shared by the widget dot and
+        the state cache (dim when unknown/stale). Aggregates across all live
+        sessions (waiting > working > done). Shared by the widget dot and
         the tray-icon pip."""
-        st = read_usage_cache(cache_path=STATE_CACHE_PATH) or {}
-        return working_state_tag(st.get("state"), st.get("updated_at"))
+        state, updated_at = aggregate_working_state(
+            read_usage_cache(cache_path=STATE_CACHE_PATH)
+        )
+        return working_state_tag(state, updated_at)
 
     class FloatingWidget:
         """Small always-on-top, borderless window showing the same live
@@ -1733,8 +2121,10 @@ def run_app():
             """Draw the RAG working-state dot and set its label from the state
             cache (written by --state-hook). Pixel-precise Canvas oval, not a
             glyph, so it's font/DPI-independent."""
-            st = read_usage_cache(cache_path=STATE_CACHE_PATH) or {}
-            tag = working_state_tag(st.get("state"), st.get("updated_at"))
+            state, updated_at = aggregate_working_state(
+                read_usage_cache(cache_path=STATE_CACHE_PATH)
+            )
+            tag = working_state_tag(state, updated_at)
             d = self._dot_d
             self.state_canvas.delete("all")
             # 1px inset so the oval's antialiased edge isn't clipped by the canvas.
@@ -1742,7 +2132,7 @@ def run_app():
                 1, 1, d - 1, d - 1, fill=WIDGET_COLORS[tag], outline="",
             )
             self.state_label.config(
-                text=working_state_label(st.get("state"), st.get("updated_at")),
+                text=working_state_label(state, updated_at),
                 fg=(self.DIM if tag == "dim" else WIDGET_COLORS[tag]),
             )
 
@@ -1816,14 +2206,14 @@ def run_app():
             self.today_label.config(
                 text=f"Today  {fmt_tokens(today_tok):>7} tok   {fmt_cost(snap['cost_today'])}"
             )
-            cache = read_usage_cache() or {}
+            eff = effective_rate_limits(read_usage_cache())
             self._render_metric_row(
                 self.session_canvas, self.session_reset_lbl,
-                cache.get("session_used_percentage"), cache.get("session_resets_at"),
+                eff["session_pct"], eff["session_resets_at"],
             )
             self._render_metric_row(
                 self.weekly_canvas, self.weekly_reset_lbl,
-                cache.get("weekly_used_percentage"), cache.get("weekly_resets_at"),
+                eff["weekly_pct"], eff["weekly_resets_at"],
             )
 
         def _compute_aligned_position(self, w, h, info):
@@ -1893,6 +2283,13 @@ def run_app():
             if not saved or saved.get("x") is None or saved.get("y") is None:
                 return
             x, y = int(saved["x"]), int(saved["y"])
+            # A favorite saved on a monitor that's since been unplugged would
+            # park the widget off-screen — clamp into the current virtual screen.
+            bounds = virtual_screen_bounds()
+            if bounds:
+                w = self.root.winfo_width() or self.root.winfo_reqwidth()
+                h = self.root.winfo_height() or self.root.winfo_reqheight()
+                x, y = clamp_position(x, y, w, h, bounds)
             self.root.geometry(f"+{x}+{y}")
             # Flush the queued move to the real Win32 window *now* -- _tick()
             # calls _reassert_topmost() right after this method returns, which
@@ -1929,6 +2326,12 @@ def run_app():
             saved = read_usage_cache(cache_path=WIDGET_POS_PATH)
             if saved and saved.get("x") is not None and saved.get("y") is not None:
                 x, y = saved["x"], saved["y"]
+                # The saved spot may be on a monitor that no longer exists
+                # (unplugged / resolution change) — clamp it back on screen,
+                # or an overrideredirect window is invisible and undraggable.
+                bounds = virtual_screen_bounds()
+                if bounds:
+                    x, y = clamp_position(x, y, w, h, bounds)
             else:
                 x, y = self._default_position(w, h)
             self.root.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
@@ -2063,24 +2466,36 @@ def run_app():
                         pass
                 self.root.quit()
                 return
-            if load_favorite_requested.is_set():
-                load_favorite_requested.clear()
-                self._apply_favorite_position()
-            if widget_visible.is_set():
-                if not self.root.winfo_viewable():
-                    self.root.deiconify()
-                    self._set_transparent(True)
-                self._render()
-                self._reassert_topmost()   # 1-second safety net for z-order
-                # Periodically re-align to the tray (handles taskbar moves, DPI changes,
-                # monitor layout changes, and tray overflow expand/collapse).
-                if ALIGNMENT_CONFIG.enabled:
-                    now = time.monotonic()
-                    if now - self._last_alignment_check > 30.0:
-                        self._recheck_alignment()
-                self.last_known_pos = (self.root.winfo_x(), self.root.winfo_y())
-            else:
-                self.root.withdraw()
+            # The whole body is guarded so ONE bad render (e.g. a corrupted
+            # cache value) degrades one tick — an uncaught exception here
+            # would end the after() chain and freeze the widget permanently.
+            try:
+                if load_favorite_requested.is_set():
+                    load_favorite_requested.clear()
+                    self._apply_favorite_position()
+                if widget_visible.is_set():
+                    if not self.root.winfo_viewable():
+                        self.root.deiconify()
+                        self._set_transparent(True)
+                    self._render()
+                    # 1-second safety net for z-order. Only re-assert when we
+                    # are demonstrably below the taskbar (or can't tell) — an
+                    # unconditional NOTOPMOST→TOPMOST cycle every second churns
+                    # the z-order and jumps above other topmost apps for no reason.
+                    if self._zorder_vs_taskbar() != "above":
+                        self._reassert_topmost()
+                    # Periodically re-align to the tray (handles taskbar moves, DPI changes,
+                    # monitor layout changes, and tray overflow expand/collapse).
+                    # A pinned widget is locked in place — never auto-moved.
+                    if ALIGNMENT_CONFIG.enabled and not position_pinned.is_set():
+                        now = time.monotonic()
+                        if now - self._last_alignment_check > 30.0:
+                            self._recheck_alignment()
+                    self.last_known_pos = (self.root.winfo_x(), self.root.winfo_y())
+                else:
+                    self.root.withdraw()
+            except Exception:
+                pass
             self.root.after(1000, self._tick)
 
         def mainloop(self):
@@ -2183,20 +2598,21 @@ def run_app():
             "Claude Code usage",
             f"Today: {fmt_tokens(today_tok)} tok ({fmt_cost(snap['cost_today'])})",
         ]
-        cache = read_usage_cache()
-        if cache:
-            if cache.get("session_used_percentage") is not None:
-                lines.append(
-                    f"Session: {cache['session_used_percentage']:.0f}% "
-                    f"(resets {fmt_reset_clock(cache.get('session_resets_at')) or '?'})"
-                )
-            if cache.get("weekly_used_percentage") is not None:
-                lines.append(
-                    f"Weekly: {cache['weekly_used_percentage']:.0f}% "
-                    f"(resets {fmt_reset_clock(cache.get('weekly_resets_at')) or '?'})"
-                )
-        st = read_usage_cache(cache_path=STATE_CACHE_PATH) or {}
-        st_label = working_state_label(st.get("state"), st.get("updated_at"))
+        eff = effective_rate_limits(read_usage_cache())
+        if eff["session_pct"] is not None:
+            lines.append(
+                f"Session: {eff['session_pct']:.0f}% "
+                f"(resets {fmt_reset_clock(eff['session_resets_at']) or '?'})"
+            )
+        if eff["weekly_pct"] is not None:
+            lines.append(
+                f"Weekly: {eff['weekly_pct']:.0f}% "
+                f"(resets {fmt_reset_clock(eff['weekly_resets_at']) or '?'})"
+            )
+        state, state_ts = aggregate_working_state(
+            read_usage_cache(cache_path=STATE_CACHE_PATH)
+        )
+        st_label = working_state_label(state, state_ts)
         if st_label != "—":
             lines.append(f"State: {st_label}")
         # Windows Shell_NotifyIcon's szTip is capped at 128 UTF-16 chars incl.
@@ -2226,37 +2642,46 @@ def run_app():
                 None, enabled=False,
             ),
             pystray.MenuItem(f"Sessions seen: {snap['session_count']}", None, enabled=False),
+            pystray.MenuItem(
+                f"(costs are estimates; prices as of {PRICES_AS_OF})",
+                None, enabled=False,
+            ),
         ]
 
-        st = read_usage_cache(cache_path=STATE_CACHE_PATH) or {}
-        st_label = working_state_label(st.get("state"), st.get("updated_at"))
+        state, state_ts = aggregate_working_state(
+            read_usage_cache(cache_path=STATE_CACHE_PATH)
+        )
+        st_label = working_state_label(state, state_ts)
         if st_label != "—":
             items.append(pystray.MenuItem(f"State:    Claude is {st_label}", None, enabled=False))
 
         items.append(pystray.Menu.SEPARATOR)
         cache = read_usage_cache()
-        has_limits = cache and (
-            cache.get("session_used_percentage") is not None
-            or cache.get("weekly_used_percentage") is not None
-        )
-        if has_limits:
-            if cache.get("session_used_percentage") is not None:
+        eff = effective_rate_limits(cache)
+        if eff["session_pct"] is not None or eff["weekly_pct"] is not None:
+            if eff["session_pct"] is not None:
                 items.append(pystray.MenuItem(
-                    f"Session (5h): {cache['session_used_percentage']:.0f}% used "
-                    f"\u2014 resets {fmt_reset_full(cache.get('session_resets_at'))}",
+                    f"Session (5h): {eff['session_pct']:.0f}% used "
+                    f"\u2014 resets {fmt_reset_full(eff['session_resets_at'])}",
                     None, enabled=False,
                 ))
-            if cache.get("weekly_used_percentage") is not None:
+            if eff["weekly_pct"] is not None:
                 items.append(pystray.MenuItem(
-                    f"Weekly (7d): {cache['weekly_used_percentage']:.0f}% used "
-                    f"\u2014 resets {fmt_reset_full(cache.get('weekly_resets_at'))}",
+                    f"Weekly (7d): {eff['weekly_pct']:.0f}% used "
+                    f"\u2014 resets {fmt_reset_full(eff['weekly_resets_at'])}",
                     None, enabled=False,
                 ))
-            if cache.get("context_used_percentage") is not None:
+            if eff["context_pct"] is not None:
                 items.append(pystray.MenuItem(
-                    f"Context window: {cache['context_used_percentage']:.0f}% used",
+                    f"Context window: {eff['context_pct']:.0f}% used",
                     None, enabled=False,
                 ))
+        elif cache:
+            # A cache exists but its windows reset (or held unusable values) --
+            # a different situation from "the hook never ran".
+            items.append(pystray.MenuItem(
+                "Session/weekly %: awaiting next Claude Code turn", None, enabled=False,
+            ))
         else:
             items.append(pystray.MenuItem("Session/weekly %: not available yet", None, enabled=False))
             items.append(pystray.MenuItem("(set up the statusLine hook \u2014 see README)", None, enabled=False))
@@ -2293,6 +2718,8 @@ def run_app():
         ))
         items.append(pystray.MenuItem("Refresh now", on_refresh))
         items.append(pystray.MenuItem("Open logs folder", on_open_folder))
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem(f"ClaudeUsageTray v{__version__}", None, enabled=False))
         items.append(pystray.MenuItem("Quit", on_quit))
         return items
 
@@ -2354,9 +2781,11 @@ def run_app():
 
         def _handle(self, path):
             is_session_file = path.endswith(".jsonl")
-            base = os.path.basename(path)
-            is_usage_cache = base == os.path.basename(USAGE_CACHE_PATH)
-            is_state_cache = base == os.path.basename(STATE_CACHE_PATH)
+            # Exact-path match (not basename): a stray file with the same name
+            # elsewhere in the tree must not masquerade as one of our caches.
+            norm = os.path.normcase(os.path.abspath(path))
+            is_usage_cache = norm == os.path.normcase(os.path.abspath(USAGE_CACHE_PATH))
+            is_state_cache = norm == os.path.normcase(os.path.abspath(STATE_CACHE_PATH))
             if not (is_session_file or is_usage_cache or is_state_cache):
                 return
             if is_session_file:
@@ -2391,8 +2820,12 @@ def run_app():
     def fallback_sweep_loop(icon):
         while True:
             time.sleep(FALLBACK_SWEEP_SECONDS)
+            # Walk the tree OUTSIDE the lock — on a big history the walk is
+            # the slow part, and holding state_lock through it would stall
+            # the widget's once-per-second snapshot read.
+            files = find_session_files(PROJECTS_DIR)
             with state_lock:
-                tracker.poll()
+                tracker.poll(files)
             icon.title = build_title()
             apply_icon_state(icon)   # safety-net recolor (e.g. rolls to dim when stale)
 
@@ -2428,6 +2861,24 @@ def run_app():
 
 def run_tests():
     import shutil
+
+    # The suite is assert-based; under `python -O` every assert is stripped
+    # and the whole run would silently "pass" without testing anything.
+    if not __debug__:
+        raise SystemExit(
+            "--test requires asserts to be enabled: run without python's -O/-OO flags."
+        )
+
+    # VERSION (read by the release workflow to tag builds) must match the
+    # in-code __version__, or a release ships mislabelled.
+    _version_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+    if os.path.isfile(_version_file):
+        with open(_version_file, encoding="utf-8") as _vf:
+            _file_version = _vf.read().strip()
+        assert _file_version == __version__, (
+            f"VERSION file ({_file_version!r}) and __version__ ({__version__!r}) drifted"
+        )
+        print("VERSION file matches __version__: OK")
 
     tmp_home = tempfile.mkdtemp()
     projects_dir = os.path.join(tmp_home, "projects")
@@ -2595,7 +3046,86 @@ def run_tests():
         assert pct_tag(60) == "yellow"
         assert pct_tag(95) == "red"
         assert pct_tag(None) == "dim"
-        print("Widget color-threshold helper: OK")
+        # corrupted cache values degrade to dim, never raise (a TypeError here
+        # once could have frozen the widget's _tick loop permanently)
+        assert pct_tag("95") == "dim"
+        assert pct_tag({"pct": 5}) == "dim"
+        assert pct_tag(True) == "dim"
+        print("Widget color-threshold helper (incl. garbage input): OK")
+
+        # --- local-date attribution (UTC JSONL timestamps vs local "today") ---
+        # 23:30 UTC on Jan 1 is Jan 2 in UTC+2 — the naive [:10] prefix
+        # comparison misattributed exactly this window every night.
+        _d = record_local_date("2026-01-01T23:30:00.000Z")
+        _expected = (
+            datetime(2026, 1, 1, 23, 30, tzinfo=timezone.utc).astimezone().date()
+        )
+        assert _d == _expected, (_d, _expected)
+        assert record_local_date(None) is None
+        assert record_local_date("") is None
+        assert record_local_date("not-a-timestamp") is None
+        print("record_local_date — UTC-to-local conversion + garbage input: OK")
+
+        # --- effective_rate_limits: staleness + type sanitisation ---
+        _now = 1_000_000.0
+        _fresh = {
+            "model": "Claude Sonnet 4.6",
+            "context_used_percentage": 20.0,
+            "session_used_percentage": 34.0, "session_resets_at": _now + 3600,
+            "weekly_used_percentage": 12.5, "weekly_resets_at": _now + 86400,
+        }
+        eff = effective_rate_limits(_fresh, now=_now)
+        assert eff["session_pct"] == 34.0 and eff["weekly_pct"] == 12.5, eff
+        assert eff["context_pct"] == 20.0 and eff["model"] == "Claude Sonnet 4.6"
+        # a window whose resets_at has passed is definitionally over — both
+        # fields null out until the next Claude turn writes fresh numbers
+        _reset = dict(_fresh, session_resets_at=_now - 10)
+        eff = effective_rate_limits(_reset, now=_now)
+        assert eff["session_pct"] is None and eff["session_resets_at"] is None, eff
+        assert eff["weekly_pct"] == 12.5, eff   # weekly window still live
+        # non-numeric garbage degrades to None, never raises
+        _garbage = {"session_used_percentage": "90", "session_resets_at": [],
+                    "weekly_used_percentage": True, "model": 7}
+        eff = effective_rate_limits(_garbage, now=_now)
+        assert eff["session_pct"] is None and eff["weekly_pct"] is None, eff
+        assert eff["model"] is None
+        assert effective_rate_limits(None)["session_pct"] is None
+        print("effective_rate_limits — staleness + type sanitisation: OK")
+
+        # --- process_statusline_payload: type-hostile payload must not raise ---
+        _bad_cache, _bad_text = process_statusline_payload({
+            "model": "not-a-dict",
+            "context_window": {"used_percentage": "22"},
+            "rate_limits": {"five_hour": {"used_percentage": None, "resets_at": "soon"}},
+        })
+        assert _bad_cache["session_used_percentage"] is None
+        assert _bad_cache["context_used_percentage"] is None
+        assert _bad_text == "Claude", _bad_text
+        _bad_cache2, _ = process_statusline_payload("not even a dict")
+        assert _bad_cache2["model"] == "Claude"
+        print("process_statusline_payload — type-hostile payload handled: OK")
+
+        # --- clamp_position: keep a remembered position on screen ---
+        _bounds = (0, 0, 1920, 1080)
+        assert clamp_position(100, 200, 300, 50, _bounds) == (100, 200)   # already inside
+        assert clamp_position(5000, 200, 300, 50, _bounds) == (1620, 200)  # off right
+        assert clamp_position(-500, -50, 300, 50, _bounds) == (0, 0)       # off left/top
+        assert clamp_position(100, 2000, 300, 50, _bounds) == (100, 1030)  # off bottom
+        # negative-origin virtual screen (monitor left of primary)
+        assert clamp_position(-3000, 0, 300, 50, (-1920, 0, 1920, 1080)) == (-1920, 0)
+        print("clamp_position — clamps into virtual-screen bounds: OK")
+
+        # --- single-instance lock (Windows: real mutex; elsewhere: None) ---
+        if sys.platform.startswith("win"):
+            _lock_name = f"Local\\ClaudeUsageTrayTest-{os.getpid()}"
+            assert acquire_single_instance_lock(_lock_name) is True
+            # second acquisition (same name, held by this very process) must
+            # report "already running"
+            assert acquire_single_instance_lock(_lock_name) is False
+            print("single-instance mutex — acquire once, second try refused: OK")
+        else:
+            assert acquire_single_instance_lock() is None
+            print("single-instance lock degrades to None off-Windows: OK")
 
         # --- statusLine hook command construction (pure, frozen-aware) ---
         exe = r"C:\Apps\ClaudeUsageTray.exe"
@@ -2666,15 +3196,27 @@ def run_tests():
 
         # Case 5: malformed settings.json (abort without writing)
         settings_path4 = os.path.join(tmp_home, "settings_broken.json")
+        broken_content = '{"broken": true,}'  # trailing comma — invalid JSON
         with open(settings_path4, "w", encoding="utf-8") as f:
-            f.write('{"broken": true,}')  # trailing comma — invalid JSON
+            f.write(broken_content)
         ok5, msg5 = install_statusline_hook(settings_path4, expected_cmd)
         assert not ok5, "should have failed on malformed JSON"
-        # File must be unchanged (still unparseable, not overwritten)
+        # File must be byte-identical (aborted without writing anything)
         with open(settings_path4, encoding="utf-8") as f:
             raw = f.read()
-        assert "broken" in raw and raw.strip().endswith("}") is False or "}" in raw
+        assert raw == broken_content, raw
         print("hook install — malformed JSON aborted cleanly: OK")
+
+        # Case 6: an ours-shaped statusLine (older install path, same
+        # --statusline-hook flag) is upgraded in place even without force
+        settings_path5 = os.path.join(tmp_home, "settings_upgrade.json")
+        old_ours = '"C:\\OldPlace\\ClaudeUsageTray.exe" --statusline-hook'
+        with open(settings_path5, "w", encoding="utf-8") as f:
+            json.dump({"statusLine": {"type": "command", "command": old_ours}}, f)
+        ok6, _ = install_statusline_hook(settings_path5, expected_cmd, force=False)
+        assert ok6
+        assert _current_statusline_command(settings_path5) == expected_cmd
+        print("hook install — force=False upgrades our own older command: OK")
 
         # --- ensure_hook_installed: auto (force=False) vs. force, plus marker ---
         auto_settings = os.path.join(tmp_home, "settings_auto.json")
@@ -2722,6 +3264,9 @@ def run_tests():
         assert derive_working_state({"hook_event_name": "Stop"}) == "done"
         assert derive_working_state({"hook_event_name": "Notification"}) == "waiting"
         assert derive_working_state({"hook_event_name": "SessionStart"}) is None
+        # SessionEnd carries no *state* — update_state_cache handles it as a
+        # session removal instead
+        assert derive_working_state({"hook_event_name": "SessionEnd"}) is None
         assert derive_working_state({}) is None           # missing field -> no state
         assert derive_working_state(None) is None
         print("derive_working_state — event mapping + missing field: OK")
@@ -2739,6 +3284,48 @@ def run_tests():
         assert working_state_label("waiting", _now, _now) == "waiting for you"
         assert working_state_label("working", _now - STATE_STALE_SECONDS - 1, _now) == "—"
         print("working_state_tag/label — colour + staleness: OK")
+
+        # --- per-session state cache: update + aggregate ---
+        # session A starts working
+        _sc1 = update_state_cache(None, {"hook_event_name": "PreToolUse", "session_id": "A"}, now=_now)
+        assert _sc1["sessions"]["A"]["state"] == "working", _sc1
+        assert _sc1["state"] == "working"
+        # session B finishes while A is still working -> aggregate stays working
+        _sc2 = update_state_cache(_sc1, {"hook_event_name": "Stop", "session_id": "B"}, now=_now + 1)
+        assert _sc2["sessions"]["B"]["state"] == "done"
+        assert _sc2["state"] == "working", _sc2   # A's amber outlives B's green
+        # waiting (red, "needs you") beats working
+        _sc3 = update_state_cache(_sc2, {"hook_event_name": "Notification", "session_id": "B"}, now=_now + 2)
+        assert _sc3["state"] == "waiting", _sc3
+        # SessionEnd removes the session entirely
+        _sc4 = update_state_cache(_sc3, {"hook_event_name": "SessionEnd", "session_id": "B"}, now=_now + 3)
+        assert "B" not in _sc4["sessions"], _sc4
+        assert _sc4["state"] == "working"          # only A remains
+        _sc5 = update_state_cache(_sc4, {"hook_event_name": "SessionEnd", "session_id": "A"}, now=_now + 4)
+        assert _sc5["sessions"] == {} and _sc5["state"] is None, _sc5
+        # unmapped events leave the cache alone (None = don't write)
+        assert update_state_cache(_sc4, {"hook_event_name": "SessionStart", "session_id": "A"}) is None
+        assert update_state_cache(_sc4, {}) is None
+        # stale entries are pruned on the next write
+        _stale = {"sessions": {"old": {"state": "working",
+                                       "updated_at": _now - STATE_STALE_SECONDS - 5}}}
+        _sc6 = update_state_cache(_stale, {"hook_event_name": "Stop", "session_id": "C"}, now=_now)
+        assert "old" not in _sc6["sessions"] and _sc6["state"] == "done", _sc6
+        # missing session_id falls back to a shared slot, never crashes
+        _sc7 = update_state_cache(None, {"hook_event_name": "Stop"}, now=_now)
+        assert _sc7["sessions"]["unknown"]["state"] == "done", _sc7
+        print("update_state_cache — per-session map, priority, SessionEnd, pruning: OK")
+
+        # aggregate_working_state: legacy single-slot cache still readable
+        assert aggregate_working_state(
+            {"state": "waiting", "updated_at": _now}, now=_now
+        ) == ("waiting", _now)
+        assert aggregate_working_state(
+            {"state": "working", "updated_at": _now - STATE_STALE_SECONDS - 1}, now=_now
+        ) == (None, None)
+        assert aggregate_working_state(None, now=_now) == (None, None)
+        assert aggregate_working_state({"sessions": {"x": "garbage"}}, now=_now) == (None, None)
+        print("aggregate_working_state — legacy fallback + garbage tolerance: OK")
 
         # --- state cache write/read round-trip (temp path, never real ~/.claude) ---
         state_cache_path = os.path.join(tmp_home, "state_cache.json")
@@ -2811,6 +3398,77 @@ def run_tests():
         _m = read_state_hooks_marker(marker_path=st_marker)
         assert _m and _m.get("command") == state_cmd, _m
         print("ensure_state_hooks_installed — marker written when in place: OK")
+
+        # (e) upgrade: an older ours-shaped command (different path, same
+        # --state-hook flag) is rewritten in place — NOT left to run alongside
+        # a freshly-appended duplicate — and our command is retired from
+        # events we no longer register (PostToolUse), while the user's own
+        # hook on that event survives.
+        st_upgrade = os.path.join(tmp_home, "settings_state_upgrade.json")
+        old_state_cmd = '"C:\\OldPlace\\ClaudeUsageTray.exe" --state-hook'
+        with open(st_upgrade, "w", encoding="utf-8") as f:
+            json.dump({"hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"type": "command", "command": old_state_cmd}]}],
+                "PostToolUse": [
+                    {"matcher": "", "hooks": [
+                        {"type": "command", "command": old_state_cmd}]},
+                    {"matcher": "", "hooks": [
+                        {"type": "command", "command": "user-posttool-hook"}]},
+                ],
+            }}, f)
+        okU, _ = install_state_hooks(st_upgrade, state_cmd)
+        assert okU
+        with open(st_upgrade, encoding="utf-8") as f:
+            udata = json.load(f)
+        stop_cmds = [h.get("command")
+                     for g in udata["hooks"]["Stop"] for h in (g.get("hooks") or [])]
+        assert stop_cmds.count(state_cmd) == 1 and old_state_cmd not in stop_cmds, stop_cmds
+        ptu_cmds = [h.get("command")
+                    for g in udata["hooks"]["PostToolUse"] for h in (g.get("hooks") or [])]
+        assert ptu_cmds == ["user-posttool-hook"], ptu_cmds
+        for ev in STATE_HOOK_EVENTS:
+            evc = [h.get("command")
+                   for g in udata["hooks"].get(ev, []) for h in (g.get("hooks") or [])]
+            assert evc.count(state_cmd) == 1, (ev, evc)
+        print("install_state_hooks — upgrades our old command, retires PostToolUse, keeps user hooks: OK")
+
+        # (f) a PostToolUse entry that is ONLY ours disappears along with its event key
+        st_prune = os.path.join(tmp_home, "settings_state_prune.json")
+        with open(st_prune, "w", encoding="utf-8") as f:
+            json.dump({"hooks": {"PostToolUse": [{"matcher": "", "hooks": [
+                {"type": "command", "command": old_state_cmd}]}]}}, f)
+        okP, _ = install_state_hooks(st_prune, state_cmd)
+        assert okP
+        with open(st_prune, encoding="utf-8") as f:
+            pdata = json.load(f)
+        assert "PostToolUse" not in pdata["hooks"], pdata["hooks"].get("PostToolUse")
+        print("install_state_hooks — fully-ours PostToolUse registration removed: OK")
+
+        # --- slim hook exe installation (pure copy logic, temp dirs only) ---
+        fake_bundle_dir = os.path.join(tmp_home, "bundle")
+        os.makedirs(fake_bundle_dir, exist_ok=True)
+        fake_bundled = os.path.join(fake_bundle_dir, HOOK_EXE_NAME)
+        with open(fake_bundled, "wb") as f:
+            f.write(b"hook-exe-v1")
+        hook_dest_dir = os.path.join(tmp_home, "bin")
+        installed = install_hook_exe(bundled_path=fake_bundled, dest_dir=hook_dest_dir)
+        assert installed == os.path.join(hook_dest_dir, HOOK_EXE_NAME), installed
+        with open(installed, "rb") as f:
+            assert f.read() == b"hook-exe-v1"
+        # idempotent: same content -> same path, no rewrite needed
+        assert install_hook_exe(bundled_path=fake_bundled, dest_dir=hook_dest_dir) == installed
+        # new content -> replaced
+        with open(fake_bundled, "wb") as f:
+            f.write(b"hook-exe-v2")
+        assert install_hook_exe(bundled_path=fake_bundled, dest_dir=hook_dest_dir) == installed
+        with open(installed, "rb") as f:
+            assert f.read() == b"hook-exe-v2"
+        # nothing bundled (plain-python run) -> None, callers fall back to
+        # registering the main exe / python command
+        assert _bundled_hook_exe_path() is None   # --test never runs frozen
+        assert install_hook_exe(bundled_path=None, dest_dir=hook_dest_dir) is None
+        print("install_hook_exe — install, idempotent re-run, upgrade, no-bundle fallback: OK")
 
         # --- taskbar tray-rect detection: must degrade gracefully off-Windows ---
         if not sys.platform.startswith("win"):
@@ -3069,7 +3727,9 @@ if __name__ == "__main__":
     cli.add_argument(
         "--statusline-hook", action="store_true",
         help="read a Claude Code statusLine JSON payload from stdin, cache the "
-             "rate-limit fields, and print a status line back (see README.md)",
+             "rate-limit fields, and print a status line back (see README.md). "
+             "Note: reads stdin to EOF, so a manual run without redirected "
+             "input (e.g. `exe --statusline-hook < payload.json`) will block",
     )
     cli.add_argument(
         "--install-hook", action="store_true",
@@ -3080,7 +3740,8 @@ if __name__ == "__main__":
         "--state-hook", action="store_true",
         help="read a Claude Code hook JSON payload from stdin and cache Claude's "
              "current working state (working/waiting/done) for the RAG indicator; "
-             "wired into settings.json's hooks array (see README.md)",
+             "wired into settings.json's hooks array (see README.md). Reads "
+             "stdin to EOF — redirect input when running it manually",
     )
     cli.add_argument(
         "--install-state-hooks", action="store_true",
@@ -3100,4 +3761,26 @@ if __name__ == "__main__":
     elif args.install_state_hooks:
         run_install_state_hooks()
     else:
-        run_app()
+        try:
+            run_app()
+        except ImportError as exc:
+            # The slim hook build (ClaudeUsageTrayHook.exe) excludes the GUI
+            # packages on purpose; someone double-clicking it should get a
+            # pointer at the real app instead of a silent crash.
+            message = (
+                f"This build can't run the tray app ({exc}).\n\n"
+                "It is the statusline/state hook helper — run ClaudeUsageTray.exe "
+                "for the tray app, or `pip install -r requirements.txt` when "
+                "running from source."
+            )
+            shown = False
+            if sys.platform.startswith("win") and getattr(sys, "frozen", False):
+                try:
+                    import ctypes
+                    ctypes.windll.user32.MessageBoxW(0, message, "Claude Usage Tray", 0x10)
+                    shown = True
+                except Exception:
+                    pass
+            if not shown:
+                _write_hook_stdout(message)
+            sys.exit(1)

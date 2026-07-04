@@ -422,6 +422,17 @@ z-order recovery latency went from ~0 to 150 ms, imperceptible in
 practice. A source-inspection regression guard in `--test` pins the
 callback body to the flag-only shape.
 
+### What it actually looks like on real Windows
+
+`docs/screenshots/` holds real-hardware captures (Windows 11, 2026-07-03,
+v1.2.0) of the three user-facing surfaces: `widget.png` (the two-row
+floating widget sitting beside the taskbar tray — note the Canvas-drawn
+bars rendering unclipped in a real Windows font, i.e. the Bug 1 fix
+holding on real hardware), `tray-tooltip.png` (the hover tooltip), and
+`tray-menu.png` (the full right-click menu). They're embedded in the
+README; if a layout change alters any of these surfaces, retake the
+affected screenshot on real Windows rather than leaving a stale one.
+
 ### How this was verified (since there's no Windows machine in the dev sandbox)
 
 There's a recurring tension in this project: development happened in a

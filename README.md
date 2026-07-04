@@ -17,18 +17,15 @@ Everything lives in one file: `claude_usage_tray.py`.
 - **At-a-glance status** — a Red/Amber/Green dot shows whether Claude is
   **working** (amber), **waiting on you** (red), or **done** (green)
 
-```
-┌──────────────────────────────────────────────────────┐
-│  Today      12.3K tok   $0.05                        │
-│  5h  ███71%███  18:42   ·   7d  ██18%░░░░  Mon 09:00 │
-└──────────────────────────────────────────────────────┘
-```
+![The floating widget tucked next to the Windows taskbar tray](docs/screenshots/widget.png)
 
 The floating widget is a borderless, always-on-top panel — just two compact rows
-(no title bar, no close button): **Today**'s tokens and cost, then the **5h** and
-**7d** bars side by side. The percentage is drawn *inside* each colored bar, with
-its reset time next to it. The tray icon shows the same numbers on
-hover/right-click. *(Drop a real screenshot here once you have one.)*
+(no title bar, no close button): the working-state dot and **Today**'s tokens and
+cost, then the **5h** and **7d** bars side by side. The percentage is drawn
+*inside* each colored bar, with its reset time next to it. The tray icon shows
+the same numbers on hover/right-click:
+
+<img src="docs/screenshots/tray-tooltip.png" alt="Tray icon tooltip showing today's usage and session/weekly percentages" width="270">
 
 ## Install
 
@@ -150,6 +147,8 @@ of the app needed.
 > so send a second message before concluding anything is wrong.
 
 ## What it shows
+
+<img src="docs/screenshots/tray-menu.png" alt="The tray icon's right-click menu: today/all-time totals, session and weekly rate limits, top models, and app controls" width="420">
 
 Right-click the tray icon (or read the floating widget) for:
 
@@ -341,6 +340,7 @@ filesystem-watcher latency.
 | `VERSION` | Single source of truth for the release version (checked against `__version__` by `--test`); the workflow tags from it. |
 | `.github/workflows/release.yml` | Builds both exes on push to `master`, smoke-tests the hooks, and publishes a GitHub release with checksums. |
 | `.github/workflows/ci.yml` | Lint (`ruff`) + test suite on Ubuntu and Windows for PRs and pushes. |
+| `docs/screenshots/` | Real-hardware screenshots used in this README (widget, tray tooltip, tray menu). |
 | `ARCHITECTURE.md` | Deep design & decision history — the three data sources, threading model, two bug postmortems, what's verified vs. not. **Read this before any architectural change.** |
 | `CLAUDE.md` | Short index / guidance for AI agents working in this repo. |
 

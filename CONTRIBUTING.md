@@ -81,7 +81,7 @@ Use the issue templates:
   start informed.
 
 For usage questions or setup help, open a
-[Discussion](https://github.com/Celtas6655/claudebar-usage/discussions) instead.
+[Discussion](https://github.com/Celtas6655/Claudebar/discussions) instead.
 
 ## Code of Conduct
 

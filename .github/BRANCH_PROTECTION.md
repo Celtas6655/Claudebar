@@ -35,7 +35,7 @@ Requires the [GitHub CLI](https://cli.github.com/) authenticated with admin
 rights (`gh auth login`). This applies the equivalent classic protection:
 
 ```bash
-gh api -X PUT repos/Celtas6655/claudebar-usage/branches/master/protection \
+gh api -X PUT repos/Celtas6655/Claudebar/branches/master/protection \
   -H "Accept: application/vnd.github+json" \
   --input - <<'JSON'
 {
@@ -58,7 +58,7 @@ JSON
 ### Option C — `gh` CLI (import the ruleset instead of classic protection)
 
 ```bash
-gh api -X POST repos/Celtas6655/claudebar-usage/rulesets \
+gh api -X POST repos/Celtas6655/Claudebar/rulesets \
   -H "Accept: application/vnd.github+json" \
   --input .github/rulesets/protect-master.json
 ```
@@ -66,8 +66,8 @@ gh api -X POST repos/Celtas6655/claudebar-usage/rulesets \
 ## Verifying
 
 ```bash
-gh api repos/Celtas6655/claudebar-usage/branches/master/protection    # classic
-gh api repos/Celtas6655/claudebar-usage/rulesets                      # rulesets
+gh api repos/Celtas6655/Claudebar/branches/master/protection    # classic
+gh api repos/Celtas6655/Claudebar/rulesets                      # rulesets
 ```
 
 > **Note:** the required check is named `test`. If you rename that job in

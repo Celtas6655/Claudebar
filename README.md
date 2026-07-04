@@ -32,7 +32,7 @@ the same numbers on hover/right-click:
 ### Recommended: download the standalone `.exe` (no Python needed)
 
 1. Grab **`Claudebar.exe`** from the
-   [latest release](https://github.com/Celtas6655/claudebar-usage/releases/latest).
+   [latest release](https://github.com/Celtas6655/Claudebar/releases/latest).
    Each release also ships a `SHA256SUMS.txt` you can verify the download
    against (`Get-FileHash Claudebar.exe` in PowerShell) — the exe isn't
    code-signed, so expect a SmartScreen prompt on first run.
@@ -64,8 +64,8 @@ to launch it at login).
   first-run taskbar placement uses `ctypes` from the standard library.
 
 ```bash
-git clone https://github.com/Celtas6655/claudebar-usage.git
-cd claudebar-usage
+git clone https://github.com/Celtas6655/Claudebar.git
+cd Claudebar
 pip install -r requirements.txt
 python claudebar.py
 ```

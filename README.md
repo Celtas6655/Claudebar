@@ -201,6 +201,12 @@ the statusLine hook is: the app only ever *adds or upgrades its own entries* and
 never removes or edits any hooks you configured yourself. Restart Claude Code
 once after first launch for the events to start firing.
 
+When the indicator **turns red** — Claude just started waiting on you — the app
+also shows a **Windows notification** ("Claude is waiting for your input"), so
+you notice even when the widget is hidden behind another window. It fires once
+per transition (staying red doesn't repeat it) and can be turned off with the
+tray menu's **"Notify when Claude needs input"** toggle.
+
 Running **several Claude Code sessions at once**? The indicator tracks each
 session separately and shows the most attention-worthy state across them: red
 ("needs you") beats amber ("working"), which beats green ("done") — so one

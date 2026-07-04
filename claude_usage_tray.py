@@ -90,6 +90,11 @@ STATE_HOOKS_MARKER_PATH = os.path.join(CLAUDE_HOME, "usage_tray_state_hooks_inst
 # so a missed Stop hook or an app started mid-turn can't leave "working" stuck on.
 STATE_STALE_SECONDS = 300
 
+# Small user-preferences sidecar (currently just the "notify when Claude needs
+# input" toggle). Same fail-soft atomic-write shape as the other sidecars; a
+# missing or corrupted file degrades to defaults, never a crash.
+PREFS_PATH = os.path.join(CLAUDE_HOME, "usage_tray_prefs.json")
+
 # Claude Code hook events we register --state-hook against, and the working state
 # each maps to. Order/keys mirror derive_working_state()'s logic; used both to
 # install the hooks and to reason about them. Notification == "Claude needs you".
@@ -439,6 +444,17 @@ def working_state_label(state, updated_at=None, now=None):
     if working_state_tag(state, updated_at, now) == "dim":
         return "—"
     return STATE_LABELS[state]
+
+
+def should_notify_waiting(prev_tag, new_tag):
+    """Pure: True when the aggregate RAG tag has just *entered* "red".
+
+    Operates on WIDGET_COLORS keys (the working_state_tag output), so
+    staleness is already folded in — a stale/unknown state arrives here as
+    "dim", i.e. not-waiting. Only the transition fires: staying red never
+    re-notifies; leaving red (working/done/dim) re-arms it so the next red
+    notifies again."""
+    return new_tag == "red" and prev_tag != "red"
 
 
 # When several Claude Code sessions are live at once, the indicator shows the
@@ -1243,6 +1259,27 @@ def read_usage_cache(cache_path=None):
             return json.load(f)
     except (OSError, json.JSONDecodeError, ValueError):
         return None
+
+
+def read_notify_pref(prefs_path=None):
+    """Whether to toast when Claude enters "waiting" (default True).
+
+    Reads the prefs sidecar fail-soft: a missing, corrupted, or wrong-typed
+    file (or key) degrades to the default, never a crash."""
+    prefs = read_usage_cache(cache_path=prefs_path or PREFS_PATH)
+    if isinstance(prefs, dict) and isinstance(prefs.get("notify_on_waiting"), bool):
+        return prefs["notify_on_waiting"]
+    return True
+
+
+def write_notify_pref(enabled, prefs_path=None):
+    """Persist the notify-on-waiting toggle, preserving any other keys the
+    prefs sidecar may grow later. Atomic + fail-soft via write_usage_cache."""
+    path = prefs_path or PREFS_PATH
+    prefs = read_usage_cache(cache_path=path)
+    prefs = prefs if isinstance(prefs, dict) else {}
+    prefs["notify_on_waiting"] = bool(enabled)
+    write_usage_cache(prefs, cache_path=path)
 
 
 def _is_our_statusline_command(command):
@@ -2581,11 +2618,23 @@ def run_app():
     def apply_icon_state(icon):
         """Recolor the tray icon's RAG pip from the current working state, but
         only when it changed. Runs on the tray/watcher threads (never touches
-        Tk); pystray supports reassigning .icon at runtime."""
+        Tk); pystray supports reassigning .icon at runtime.
+
+        Also the single place that sees state *transitions*, so the
+        notify-on-waiting toast fires from here: entering red (Claude needs
+        input) shows a native balloon via pystray's Shell_NotifyIcon wrapper.
+        The startup seed of _icon_state["tag"] means an app launched while
+        already red stays quiet — only a live transition notifies."""
         tag = current_state_tag()
-        if tag == _icon_state["tag"]:
+        prev_tag = _icon_state["tag"]
+        if tag == prev_tag:
             return
         _icon_state["tag"] = tag
+        if should_notify_waiting(prev_tag, tag) and read_notify_pref():
+            try:
+                icon.notify("Claude is waiting for your input", "Claude Code")
+            except Exception:
+                pass  # a failed balloon must never take down the watcher thread
         try:
             icon.icon = make_icon_image(tag)
         except Exception:
@@ -2710,6 +2759,11 @@ def run_app():
             checked=lambda item: is_startup_enabled(),
             enabled=lambda item: sys.platform.startswith("win"),
         ))
+        items.append(pystray.MenuItem(
+            "Notify when Claude needs input",
+            on_toggle_notify,
+            checked=lambda item: read_notify_pref(),
+        ))
         items.append(pystray.MenuItem("Save current position as favorite", on_save_favorite))
         items.append(pystray.MenuItem(
             "Load favorite position",
@@ -2750,6 +2804,12 @@ def run_app():
         # The registry value itself is the source of truth, re-read fresh
         # here and in the checked= lambda above -- no in-memory mirror needed.
         set_startup_enabled(not is_startup_enabled())
+
+    def on_toggle_notify(icon, item):
+        # Tray thread. The prefs sidecar is the source of truth, re-read fresh
+        # here and in the checked= lambda above -- no in-memory mirror needed
+        # (same shape as on_toggle_startup).
+        write_notify_pref(not read_notify_pref())
 
     def on_save_favorite(icon, item):
         # Tray thread. Reads the widget's position mirror (a plain tuple kept
@@ -2802,6 +2862,15 @@ def run_app():
         def on_created(self, event):
             if not event.is_directory:
                 self._handle(event.src_path)
+
+        def on_moved(self, event):
+            # The caches are written atomically (temp file + os.replace), and
+            # on Windows that replace surfaces as a single "moved" event whose
+            # dest_path is the real cache file — no modified/created ever fires
+            # on the target path. Without this handler, cache updates only
+            # landed on the 30s fallback sweep (a visibly delayed toast/pip).
+            if not event.is_directory:
+                self._handle(event.dest_path)
 
     def watcher_loop(icon):
         observer = None       # watches PROJECTS_DIR recursively for session files
@@ -2999,6 +3068,60 @@ def run_tests():
                 print("Filesystem watcher: no event observed in 3s (may be unsupported in this environment)")
         except ImportError:
             print("watchdog not installed — skipping live watcher latency check")
+
+        # --- atomic cache writes must be observable by the watcher ---
+        # write_usage_cache uses temp file + os.replace; on Windows that
+        # surfaces as a single "moved" event (dest_path = the cache file) with
+        # NO modified/created on the target path. SessionFileHandler therefore
+        # handles on_moved via dest_path — without it, cache updates only land
+        # on the 30s fallback sweep (delayed toast / tray pip recolor).
+        try:
+            from watchdog.observers import Observer
+            from watchdog.events import FileSystemEventHandler
+
+            watch_dir = os.path.join(tmp_home, "atomic_watch")
+            os.makedirs(watch_dir, exist_ok=True)
+            atomic_target = os.path.join(watch_dir, "usage_tray_state_cache.json")
+            write_usage_cache({"state": "working"}, cache_path=atomic_target)  # preexisting
+
+            class _AtomicHandler(FileSystemEventHandler):
+                """Mirrors SessionFileHandler's event coverage: src_path for
+                modified/created, dest_path for moved."""
+                def __init__(self):
+                    self.fired = threading.Event()
+
+                def _check(self, path):
+                    if path and os.path.normcase(os.path.abspath(path)) == \
+                            os.path.normcase(os.path.abspath(atomic_target)):
+                        self.fired.set()
+
+                def on_modified(self, event):
+                    if not event.is_directory:
+                        self._check(event.src_path)
+
+                def on_created(self, event):
+                    if not event.is_directory:
+                        self._check(event.src_path)
+
+                def on_moved(self, event):
+                    if not event.is_directory:
+                        self._check(event.dest_path)
+
+            _ah = _AtomicHandler()
+            _aobs = Observer()
+            _aobs.schedule(_ah, watch_dir, recursive=False)
+            _aobs.start()
+            time.sleep(0.3)  # let the observer attach
+            write_usage_cache({"state": "waiting"}, cache_path=atomic_target)
+            _adetected = _ah.fired.wait(timeout=3)
+            _aobs.stop()
+            _aobs.join(timeout=2)
+            if _adetected:
+                print("atomic cache write observed by watcher (moved/modified/created): OK")
+            else:
+                print("atomic cache write: no event observed in 3s (may be unsupported here)")
+        except ImportError:
+            pass  # already reported by the latency check above
 
         # --- statusLine rate-limit cache layer ---
         sample_payload = {
@@ -3326,6 +3449,41 @@ def run_tests():
         assert aggregate_working_state(None, now=_now) == (None, None)
         assert aggregate_working_state({"sessions": {"x": "garbage"}}, now=_now) == (None, None)
         print("aggregate_working_state — legacy fallback + garbage tolerance: OK")
+
+        # --- should_notify_waiting: only the transition INTO red fires ---
+        assert should_notify_waiting("yellow", "red")          # working -> waiting
+        assert should_notify_waiting("green", "red")           # done -> waiting
+        assert should_notify_waiting("dim", "red")             # unknown -> waiting
+        assert should_notify_waiting(None, "red")              # first-ever observation
+        assert not should_notify_waiting("red", "red")         # stays waiting: no re-fire
+        assert not should_notify_waiting("red", "yellow")      # leaving red is silent
+        assert not should_notify_waiting("red", "dim")         # going stale is silent
+        assert not should_notify_waiting("yellow", "green")    # non-red transitions silent
+        # waiting -> working -> waiting notifies again (re-armed by leaving red)
+        _tags = ["yellow", "red", "yellow", "red"]
+        _fires = [should_notify_waiting(a, b) for a, b in zip(_tags, _tags[1:])]
+        assert _fires == [True, False, True], _fires
+        print("should_notify_waiting — transition-only, re-arm on leaving red: OK")
+
+        # --- notify pref sidecar: default, round-trip, corruption fallback ---
+        prefs_path = os.path.join(tmp_home, "prefs.json")
+        assert read_notify_pref(prefs_path=prefs_path) is True   # missing file -> default on
+        write_notify_pref(False, prefs_path=prefs_path)
+        assert read_notify_pref(prefs_path=prefs_path) is False
+        write_notify_pref(True, prefs_path=prefs_path)
+        assert read_notify_pref(prefs_path=prefs_path) is True
+        # other keys in the sidecar survive a toggle write
+        write_usage_cache({"notify_on_waiting": False, "future_key": 7}, cache_path=prefs_path)
+        write_notify_pref(True, prefs_path=prefs_path)
+        _prefs = read_usage_cache(cache_path=prefs_path)
+        assert _prefs == {"notify_on_waiting": True, "future_key": 7}, _prefs
+        # corrupted file / wrong-typed value degrade to the default, no crash
+        with open(prefs_path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        assert read_notify_pref(prefs_path=prefs_path) is True
+        write_usage_cache({"notify_on_waiting": "yes"}, cache_path=prefs_path)
+        assert read_notify_pref(prefs_path=prefs_path) is True
+        print("notify pref sidecar — default, round-trip, corruption fallback: OK")
 
         # --- state cache write/read round-trip (temp path, never real ~/.claude) ---
         state_cache_path = os.path.join(tmp_home, "state_cache.json")
@@ -3715,6 +3873,26 @@ def run_tests():
             "called next in the same _tick() invocation, can cancel the pending move"
         )
         print("_apply_favorite_position flushes geometry before returning: OK")
+
+        # Guard: SessionFileHandler must handle on_moved via dest_path.
+        #
+        # Background: all our caches are written atomically (temp + os.replace),
+        # which Windows reports as one "moved" event — never modified/created on
+        # the target. Dropping on_moved silently re-breaks watcher-driven cache
+        # updates (state toast, tray pip), deferring them to the 30s sweep.
+        _sfh = re.search(
+            r"class SessionFileHandler\(FileSystemEventHandler\):(.*?)(?=\n    def )",
+            _src, re.DOTALL,
+        )
+        assert _sfh, "SessionFileHandler not found in source"
+        _sfh_body = _sfh.group(1)
+        assert "def on_moved" in _sfh_body, \
+            "REGRESSION: SessionFileHandler must handle on_moved — atomic os.replace " \
+            "cache writes surface as 'moved' events on Windows, not modified/created"
+        assert "event.dest_path" in _sfh_body.split("def on_moved", 1)[1], \
+            "REGRESSION: on_moved must dispatch on event.dest_path (the real cache " \
+            "path after an atomic replace), not src_path (the .tmp file)"
+        print("SessionFileHandler handles on_moved (atomic-replace cache writes): OK")
 
         print("\nALL TESTS PASSED")
     finally:

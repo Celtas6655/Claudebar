@@ -228,6 +228,23 @@ file changes (watched by the existing non-recursive `CLAUDE_HOME`
 observer) and on the fallback sweep. The widget self-polls the state cache
 in its 1-second `_tick`, consistent with §5's model.
 
+**Notify-on-waiting toast**: when the aggregate tag *transitions into* red
+(Claude needs input), the app shows a native Windows balloon/toast via
+pystray's `icon.notify()` (Shell_NotifyIcon under the hood — no new
+dependency). The transition detection is the pure module-level
+`should_notify_waiting(prev_tag, new_tag)`: it operates on
+`working_state_tag()` outputs, so staleness is already folded in ("dim" =
+not-waiting), staying red never re-fires, and leaving red re-arms it. The
+call site is `apply_icon_state()` — the one place that already dedupes tag
+changes on the watcher/sweep threads — and because `_icon_state["tag"]` is
+seeded at startup, launching the app while a session is already red stays
+quiet; only a live transition notifies. A tray-menu toggle ("Notify when
+Claude needs input", default on) persists to the `usage_tray_prefs.json`
+sidecar via `read_notify_pref()`/`write_notify_pref()` (fail-soft, atomic,
+corrupted file degrades to the default). Whether the balloon visually
+renders on real Windows has NOT been field-verified (pystray's win32
+backend is expected to work; the dev environment can't display it).
+
 ## 3. Why a single Python file
 
 This started as a multi-file Python project (`parser.py` + `app.py` +
@@ -310,7 +327,14 @@ Two separate `watchdog` `Observer`s are started (in `watcher_loop()`):
 one recursive on `PROJECTS_DIR` (reacts to any `.jsonl` write — token
 data), one non-recursive on `CLAUDE_HOME` itself (reacts to the one
 `usage_tray_cache.json` file changing — rate-limit data, written by the
-statusline hook). Both retry on a 5-second loop until their target
+statusline hook). `SessionFileHandler` must keep handling **`on_moved`
+(via `event.dest_path`)** alongside modified/created: our caches are
+written atomically (temp + `os.replace`), and on Windows that replace
+surfaces as a single "moved" event — no modified/created ever fires on
+the target path (verified empirically on real Windows, 2026-07-04; a
+regression guard in `--test` pins it). Before this was handled, every
+cache-driven update (tray pip recolor, the notify-on-waiting toast) was
+silently deferred to the 30-second fallback sweep. Both retry on a 5-second loop until their target
 directory exists, in case the app is started before Claude Code has ever
 run (so `~/.claude/projects` doesn't exist yet). A `fallback_sweep_loop`
 does a full rescan every 30 seconds regardless, purely as a safety net —
@@ -502,6 +526,7 @@ Everything this app reads or writes, and why:
 | `~/.claude/usage_tray_state_cache.json` | `--state-hook` mode | tray icon (RAG pip), floating widget (RAG dot), tray menu/tooltip | Claude Code's current working state (`working`/`waiting`/`done`) + `updated_at`. Coloured Red/Amber/Green; treated as unknown (dim) past `STATE_STALE_SECONDS`. Atomic write. See §2c. |
 | `~/.claude/usage_tray_state_hooks_installed.json` | `write_state_hooks_marker` (via `ensure_state_hooks_installed`) | tray menu indicator; avoid redundant writes | Marker recording that *we* merged the `--state-hook` entries into `settings.json`'s `hooks` array, and the command we wrote. Separate sidecar, NOT a key in `settings.json`. Same atomic-write shape. |
 | `~/.claude/bin/ClaudeUsageTrayHook.exe` | `install_hook_exe()` (extracted from the frozen main exe's bundle at startup) | Claude Code itself (spawned as the statusLine / state-hook command) | Slim GUI-free build of the same script, so per-turn hook spawns don't pay the full onefile extraction (§9). Content-compared before replacing; replace failure while a hook is running keeps the old copy (fail-soft). Absent when running from source. |
+| `~/.claude/usage_tray_prefs.json` | tray menu's "Notify when Claude needs input" toggle (`on_toggle_notify` → `write_notify_pref`) | `read_notify_pref()` (menu `checked=` state and the notify decision in `apply_icon_state`) | Small user-preferences sidecar; currently just `notify_on_waiting` (bool, default true). Toggle writes preserve unknown keys. Same atomic-write, fail-soft shape. |
 | `~/.claude/usage_tray_widget_pos.json` | `FloatingWidget._end_drag()` | `FloatingWidget._default_position()` | Remembers where the user dragged the widget, so the taskbar-detection heuristic only applies once, ever. |
 | `~/.claude/usage_tray_widget_favorite_pos.json` | tray menu's "Save current position as favorite" (`on_save_favorite`, via `widget.last_known_pos`) | `FloatingWidget._apply_favorite_position()`; "Load favorite position" menu item's `enabled=` check | User-designated single favorite screen position, independent of the last-dragged position (`usage_tray_widget_pos.json`). Same atomic-write shape. |
 | `~/.claude/settings.json` | the user, or this app's auto-install (`ensure_hook_installed` / `ensure_state_hooks_installed`), or `--install-hook` / `--install-state-hooks` (force) | Claude Code itself | Two things the app manages here: `statusLine.command` (rate-limit data, §2b) and `hooks.<event>[]` entries for `--state-hook` (working state, §2c). On startup it adds its `statusLine` when absent and its `hooks` entries when missing; it only ever **appends** its own hook groups and never removes/edits the user's own `statusLine` or `hooks` (unless the corresponding `--install-*` force flag is used). Writes nothing else — a stray key would break the file's strict parse, §10. |

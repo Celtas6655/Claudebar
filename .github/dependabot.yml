@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # requirements.txt is pinned exactly on purpose (see the comment in the
+  # file itself) because these versions flow straight into the released exe.
+  # Dependabot's job here is only to surface that an upstream update exists —
+  # bumps still get reviewed and verified (--test + a real build) by hand,
+  # never auto-merged.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

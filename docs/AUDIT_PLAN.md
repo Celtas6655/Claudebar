@@ -1,5 +1,9 @@
 # Audit remediation plan — 2026-07-03
 
+> **Status: completed.** All items (including the verification gate) landed
+> in v1.2.0; kept in `docs/` as a historical record. Current architecture
+> decisions live in `ARCHITECTURE.md` at the repo root.
+
 Source: full-app audit (security / performance / gaps / upgrades) performed on
 2026-07-03 against `develop` @ 6eafd7e. Each item below states the decision
 taken and the concrete change. Checkboxes are ticked as work lands. Items are

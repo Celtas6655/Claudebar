@@ -615,6 +615,28 @@ advance:
   bottom), aren't specially handled. Low-stakes because it's a
   first-launch-only heuristic (see above), but worth knowing if someone
   reports it.
+- **The widget is unavoidably hidden behind the taskbar while the Start
+  menu is open.** Verified by direct measurement on real Windows 11
+  (2026-07-04): the moment Start opens, Windows promotes `Shell_TrayWnd`
+  out of the normal desktop z-order band (band 1) into a protected
+  shell band (band 6, one of the `ZBID_*` immersive bands — readable via
+  the undocumented `user32!GetWindowBand`), and it vanishes from the
+  normal `GetTopWindow`/`GW_HWNDNEXT` chain entirely. Higher bands draw
+  above *all* lower-band windows regardless of TOPMOST, and only
+  OS-signed system processes can create windows in higher bands
+  (`CreateWindowInBand`), so no reassert can win — running the exact
+  `_reassert_topmost()` sequence while Start was open moved the widget to
+  the top of band 1 with no visual effect. Recovery after Start closes is
+  already handled: the taskbar drops back into band 1 (landing above the
+  widget), the foreground-change WinEvent reasserts within ~150 ms, and
+  the 1-second `_tick` safety net covers the measured case where closing
+  Start (Esc) fires no foreground change. Two incidental facts from the
+  same measurement: while Start is open `_zorder_vs_taskbar()` returns
+  "unknown" (taskbar absent from the chain), so `_tick` reasserts once a
+  second — a harmless no-op against band 6; and the only real mitigation
+  is user-side (drag the widget above the taskbar area). If the widget
+  ever stays hidden for more than ~1 s *after* Start closes, that's a
+  genuine bug in the recovery path, not this limitation.
 - **`rate_limits` is typically empty on the very first statusline render
   of a new/cleared session** — populates after the first completed
   response, not before. Don't mistake this for a bug during support

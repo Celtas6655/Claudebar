@@ -37,7 +37,7 @@ jobs:
           python -m ruff check .
 
       - name: Run test suite
-        run: python claude_usage_tray.py --test
+        run: python claudebar.py --test
 
   test-windows:
     runs-on: windows-latest
@@ -52,4 +52,4 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Run test suite
-        run: python claude_usage_tray.py --test
+        run: python claudebar.py --test

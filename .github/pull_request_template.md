@@ -18,7 +18,7 @@
 
 ## How it was tested
 
-- [ ] `python claude_usage_tray.py --test` passes
+- [ ] `python claudebar.py --test` passes
 - [ ] Ran the tray app manually
 - [ ] Tested the hook with `cmd` redirection (`exe < in.txt > out.txt`),
       **not** a PowerShell pipe (which doesn't capture a GUI-subsystem exe's stdout)

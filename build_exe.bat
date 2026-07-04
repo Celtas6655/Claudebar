@@ -7,11 +7,11 @@ REM Requires: pip install pyinstaller (and the runtime deps in requirements.txt)
 
 python generate_icon.py || exit /b 1
 
-REM Slim hook exe first -- ClaudeUsageTray.spec embeds it when present, so the
+REM Slim hook exe first -- Claudebar.spec embeds it when present, so the
 REM installed app can register a fast, GUI-free hook command (see
-REM install_hook_exe in claude_usage_tray.py).
-pyinstaller ClaudeUsageTrayHook.spec || exit /b 1
-pyinstaller ClaudeUsageTray.spec || exit /b 1
+REM install_hook_exe in claudebar.py).
+pyinstaller ClaudebarHook.spec || exit /b 1
+pyinstaller Claudebar.spec || exit /b 1
 
 echo.
-echo Built dist\ClaudeUsageTray.exe (with dist\ClaudeUsageTrayHook.exe embedded)
+echo Built dist\Claudebar.exe (with dist\ClaudebarHook.exe embedded)

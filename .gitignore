@@ -1,8 +1,8 @@
 # PyInstaller build artifacts
 build/
 dist/
-# NOTE: *.spec is deliberately NOT ignored — ClaudeUsageTray.spec and
-# ClaudeUsageTrayHook.spec are the canonical build definitions that CI runs.
+# NOTE: *.spec is deliberately NOT ignored — Claudebar.spec and
+# ClaudebarHook.spec are the canonical build definitions that CI runs.
 
 # Python
 __pycache__/

@@ -10,7 +10,7 @@ are and how to (re)apply them, so the config isn't lost knowledge.
 - **1 approving review** required before merge; stale approvals are dismissed
   when new commits are pushed.
 - **CI must pass** — the `test` status check (from
-  [`ci.yml`](workflows/ci.yml), which runs `python claude_usage_tray.py --test`)
+  [`ci.yml`](workflows/ci.yml), which runs `python claudebar.py --test`)
   must be green, and the branch must be up to date with `master` before merging.
 - **Conversations must be resolved** before merge.
 - **No force pushes** (`non_fast_forward`) and **no branch deletion**.

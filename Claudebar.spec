@@ -1,12 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Canonical build definition for the main exe. build_exe.bat and the release
-# workflow both run `pyinstaller ClaudeUsageTray.spec` — don't add a parallel
+# workflow both run `pyinstaller Claudebar.spec` — don't add a parallel
 # command-line flag soup anywhere, keep changes here.
 #
-# Build ClaudeUsageTrayHook.spec FIRST: when dist/ClaudeUsageTrayHook.exe
+# Build ClaudebarHook.spec FIRST: when dist/ClaudebarHook.exe
 # exists it is embedded as bundled data, and the app extracts it to
 # ~/.claude/bin at startup and registers it as the hook command
-# (install_hook_exe() in claude_usage_tray.py). Without it the app falls back
+# (install_hook_exe() in claudebar.py). Without it the app falls back
 # to registering itself — slower per hook call, but fully functional.
 import os
 
@@ -20,16 +20,16 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('watchdog')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
-if os.path.exists(os.path.join('dist', 'ClaudeUsageTrayHook.exe')):
-    datas += [(os.path.join('dist', 'ClaudeUsageTrayHook.exe'), '.')]
+if os.path.exists(os.path.join('dist', 'ClaudebarHook.exe')):
+    datas += [(os.path.join('dist', 'ClaudebarHook.exe'), '.')]
 else:
-    print('WARNING: dist/ClaudeUsageTrayHook.exe not found — building WITHOUT '
+    print('WARNING: dist/ClaudebarHook.exe not found — building WITHOUT '
           'the slim hook exe (hooks will spawn the full bundle each call). '
-          'Run `pyinstaller ClaudeUsageTrayHook.spec` first.')
+          'Run `pyinstaller ClaudebarHook.spec` first.')
 
 
 a = Analysis(
-    ['claude_usage_tray.py'],
+    ['claudebar.py'],
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -49,7 +49,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='ClaudeUsageTray',
+    name='Claudebar',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -28,13 +28,13 @@ jobs:
         run: python -m pip install -r requirements.txt pyinstaller==6.21.0
 
       - name: Run test suite (gate)
-        run: python claude_usage_tray.py --test
+        run: python claudebar.py --test
 
       - name: Build exes (slim hook exe first — the main spec embeds it)
         run: |
           python generate_icon.py
-          pyinstaller ClaudeUsageTrayHook.spec
-          pyinstaller ClaudeUsageTray.spec
+          pyinstaller ClaudebarHook.spec
+          pyinstaller Claudebar.spec
 
       - name: Smoke-test the statusline hook from both exes (gate)
         shell: cmd
@@ -44,10 +44,10 @@ jobs:
         # this gate MUST use cmd redirection, or it would spuriously "fail".
         run: |
           echo {"model":{"display_name":"test"},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":4102444800}}}> payload.json
-          dist\ClaudeUsageTray.exe --statusline-hook < payload.json > hookout.txt
+          dist\Claudebar.exe --statusline-hook < payload.json > hookout.txt
           type hookout.txt
           findstr /C:"test | 5h 50%" hookout.txt || (echo MAIN EXE HOOK SMOKE TEST FAILED & exit /b 1)
-          dist\ClaudeUsageTrayHook.exe --statusline-hook < payload.json > hookout2.txt
+          dist\ClaudebarHook.exe --statusline-hook < payload.json > hookout2.txt
           type hookout2.txt
           findstr /C:"test | 5h 50%" hookout2.txt || (echo SLIM HOOK EXE SMOKE TEST FAILED & exit /b 1)
 
@@ -68,8 +68,8 @@ jobs:
             exit 0
           fi
           # Checksums so downloads are verifiable (the exe is not code-signed).
-          (cd dist && sha256sum ClaudeUsageTray.exe) > SHA256SUMS.txt
+          (cd dist && sha256sum Claudebar.exe) > SHA256SUMS.txt
           cat SHA256SUMS.txt
-          gh release create "$tag" dist/ClaudeUsageTray.exe SHA256SUMS.txt \
+          gh release create "$tag" dist/Claudebar.exe SHA256SUMS.txt \
             --title "$tag" \
-            --notes "Standalone Windows executable for the Claude Code usage tray. No Python required — download \`ClaudeUsageTray.exe\`, run it, and it wires up the statusLine hook automatically (restart Claude Code once). Verify the download against \`SHA256SUMS.txt\`."
+            --notes "Standalone Windows executable for Claudebar (Claude Code usage tray). No Python required — download \`Claudebar.exe\`, run it, and it wires up the statusLine hook automatically (restart Claude Code once). Verify the download against \`SHA256SUMS.txt\`."

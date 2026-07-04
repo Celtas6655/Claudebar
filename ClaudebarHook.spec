@@ -1,14 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Slim companion hook exe: the same claude_usage_tray.py, but with every GUI
+# Slim companion hook exe: the same claudebar.py, but with every GUI
 # package excluded. Claude Code spawns the hook command on EVERY statusline
 # render and EVERY registered lifecycle event (PreToolUse is blocking), and a
 # --onefile build self-extracts its whole bundle on each launch — so the hook
 # must not carry Pillow/pystray/watchdog/tkinter, only the stdlib-only hook
-# code paths. Built FIRST; ClaudeUsageTray.spec then embeds the result so the
+# code paths. Built FIRST; Claudebar.spec then embeds the result so the
 # release stays a single downloadable exe (see install_hook_exe()).
 
 a = Analysis(
-    ['claude_usage_tray.py'],
+    ['claudebar.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -33,7 +33,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='ClaudeUsageTrayHook',
+    name='ClaudebarHook',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

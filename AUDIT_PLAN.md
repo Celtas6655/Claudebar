@@ -124,14 +124,14 @@ real `~/.claude`.
   The dominant hook cost for frozen installs is PyInstaller onefile
   self-extraction of the *full* bundle (Pillow/pystray/watchdog/tkinter) on
   every statusline render and every tool call. Fix: build a second, slim,
-  windowed exe `ClaudeUsageTrayHook.exe` (same script, GUI packages
+  windowed exe `ClaudebarHook.exe` (same script, GUI packages
   excluded), embed it into the main exe as bundled data, extract it to
   `~/.claude/bin/` at startup (atomic, hash-compared, fail-soft), and
   register *it* as the statusLine/state-hook command. Fallback at every step
   is the old behaviour (register the main exe). Single-file download UX is
   preserved.
-  - `ClaudeUsageTrayHook.spec` (new), `ClaudeUsageTray.spec` bundles
-    `dist/ClaudeUsageTrayHook.exe` when present.
+  - `ClaudebarHook.spec` (new), `Claudebar.spec` bundles
+    `dist/ClaudebarHook.exe` when present.
   - `_resolve_hook_command()` / `_resolve_state_hook_command()` prefer the
     extracted hook exe when running frozen.
   - CI smoke-tests the slim exe's hook path too.
@@ -164,14 +164,14 @@ real `~/.claude`.
 
 - [x] **5.1 Docs updated** for everything above: ARCHITECTURE.md §2c (state
   cache schema, event set, aggregation priority), §8 (new
-  `~/.claude/bin/ClaudeUsageTrayHook.exe` row), §9 (hook-latency
+  `~/.claude/bin/ClaudebarHook.exe` row), §9 (hook-latency
   characteristics, settings.json read-modify-write race note, startup
   full-rescan cost), README (checksums, hook exe, staleness behaviour),
   CLAUDE.md where its summaries changed.
 
 - [x] **5.2 Version bump** to 1.2.0 (`__version__` + `VERSION`) — behaviour
   changes (hook events, cache schema, staleness display) warrant a minor
-  bump. Tray menu gains a disabled `ClaudeUsageTray v1.2.0` line so users can
+  bump. Tray menu gains a disabled `Claudebar v1.2.0` line so users can
   tell which build they run (audit #14).
 
 - [x] **5.3 Priced-as-of marker (audit: smaller items).** `PRICES_AS_OF`
@@ -196,7 +196,7 @@ real `~/.claude`.
 
 ## Verification gate (all must pass before done)
 
-- [x] `python claude_usage_tray.py --test` — all tests green on real Windows.
+- [x] `python claudebar.py --test` — all tests green on real Windows.
 - [x] `ruff check .` clean.
 - [x] Local PyInstaller build of both exes; `cmd`-redirection smoke test of
   `--statusline-hook` on the slim exe (per ARCHITECTURE §9: never a

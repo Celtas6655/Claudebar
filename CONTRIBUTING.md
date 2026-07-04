@@ -1,4 +1,4 @@
-# Contributing to Claude Code Usage Tray
+# Contributing to Claudebar
 
 Thanks for your interest in improving this project. It's a small, single-file
 Windows tray app, and it's intentionally kept simple — these notes exist so a
@@ -22,12 +22,12 @@ first draft, and it's easy to reintroduce a fixed bug by "simplifying."
   pip install -r requirements.txt
   ```
 
-- Run the app: `python claude_usage_tray.py`
-- Run the tests: `python claude_usage_tray.py --test`
+- Run the app: `python claudebar.py`
+- Run the tests: `python claudebar.py --test`
 
 ## Before you open a pull request
 
-1. **`python claude_usage_tray.py --test` must pass** — and it must stay
+1. **`python claudebar.py --test` must pass** — and it must stay
    GUI-free. The suite imports no `pystray`/`Pillow`/`tkinter` at module level
    and never touches your real `~/.claude` directory. Don't break either
    property.

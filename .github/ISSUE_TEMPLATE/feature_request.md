@@ -22,7 +22,7 @@ assignees: ''
 
 <!-- Optional. A few things worth knowing before proposing big changes: -->
 
-- The app is deliberately a **single Python file** (`claude_usage_tray.py`).
+- The app is deliberately a **single Python file** (`claudebar.py`).
   Splitting into a package is a conscious tradeoff, not a default.
 - Session/weekly **% can't be derived locally** — it's account-level server
   state exposed only through Claude Code's statusLine payload.

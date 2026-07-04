@@ -40,7 +40,7 @@ assignees: ''
 - Is `statusLine.command` configured in `~/.claude/settings.json`? [ ] yes / [ ] no / [ ] not sure
 - Does this print `test | 5h 50%`?
   ```
-  echo '{"model":{"display_name":"test"},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1782500000}}}' | python claude_usage_tray.py --statusline-hook
+  echo '{"model":{"display_name":"test"},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1782500000}}}' | python claudebar.py --statusline-hook
   ```
   Output:
 - Have you sent at least **two** full Claude Code turns since starting/clearing the session?
@@ -49,7 +49,7 @@ assignees: ''
 ## Environment
 
 - App version / commit:
-- Running as: [ ] `python claude_usage_tray.py` / [ ] bundled `.exe`
+- Running as: [ ] `python claudebar.py` / [ ] bundled `.exe`
 - Windows version:
 - Python version (`python --version`):
 - Claude Code version:

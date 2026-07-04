@@ -1,4 +1,4 @@
-# Claude Code Usage Tray
+# Claudebar
 
 A small **Windows** system tray app + floating widget that shows live token
 usage, estimated cost, your session/weekly rate-limit status, and a
@@ -6,7 +6,7 @@ Red/Amber/Green indicator of what Claude Code is doing right now for
 [Claude Code](https://claude.ai/code) — read straight from Claude Code's own
 local data.
 
-Everything lives in one file: `claude_usage_tray.py`.
+Everything lives in one file: `claudebar.py`.
 
 - **No API key needed** — it reads Claude Code's local session logs, not the API
 - **No network access of its own** — nothing is uploaded anywhere
@@ -31,10 +31,10 @@ the same numbers on hover/right-click:
 
 ### Recommended: download the standalone `.exe` (no Python needed)
 
-1. Grab **`ClaudeUsageTray.exe`** from the
+1. Grab **`Claudebar.exe`** from the
    [latest release](https://github.com/Celtas6655/claudebar-usage/releases/latest).
    Each release also ships a `SHA256SUMS.txt` you can verify the download
-   against (`Get-FileHash ClaudeUsageTray.exe` in PowerShell) — the exe isn't
+   against (`Get-FileHash Claudebar.exe` in PowerShell) — the exe isn't
    code-signed, so expect a SmartScreen prompt on first run.
 2. Double-click it. That's it — a tray icon and floating widget appear, and the
    app **wires up the statusLine hook for you automatically** (it adds the entry
@@ -47,7 +47,7 @@ and the auto-install. Nothing to install, no Python required. Put it wherever yo
 like (and see [Run it automatically when Windows starts](#run-it-automatically-when-windows-starts)
 to launch it at login).
 
-> On startup the exe also extracts a small helper, `ClaudeUsageTrayHook.exe`,
+> On startup the exe also extracts a small helper, `ClaudebarHook.exe`,
 > to `~/.claude/bin/` and registers *that* as the hook command. It's the same
 > program minus the GUI packages, so the hooks Claude Code spawns on every turn
 > start in well under half the time of the full exe. If the helper can't be
@@ -67,7 +67,7 @@ to launch it at login).
 git clone https://github.com/Celtas6655/claudebar-usage.git
 cd claudebar-usage
 pip install -r requirements.txt
-python claude_usage_tray.py
+python claudebar.py
 ```
 
 A small icon appears in the system tray (bottom-right, possibly tucked inside
@@ -105,7 +105,7 @@ back? Just launch the app again.)
 `statusLine` with its own hook:
 
 ```bash
-ClaudeUsageTray.exe --install-hook       # or: python claude_usage_tray.py --install-hook
+Claudebar.exe --install-hook       # or: python claudebar.py --install-hook
 ```
 
 Either way the write is atomic and refuses to touch the file if it can't be
@@ -119,12 +119,12 @@ Code**.
 {
   "statusLine": {
     "type": "command",
-    "command": "C:/full/path/to/ClaudeUsageTray.exe --statusline-hook"
+    "command": "C:/full/path/to/Claudebar.exe --statusline-hook"
   }
 }
 ```
 
-…or, if running from source, `"python C:/full/path/to/claude_usage_tray.py
+…or, if running from source, `"python C:/full/path/to/claudebar.py
 --statusline-hook"`. Use forward slashes (Windows accepts them here, and it
 avoids JSON backslash-escaping headaches). Restart Claude Code.
 
@@ -264,21 +264,21 @@ To build one locally (or just run `build_exe.bat`, which does exactly this):
 ```bash
 pip install pyinstaller
 python generate_icon.py
-pyinstaller ClaudeUsageTrayHook.spec   # slim hook helper first…
-pyinstaller ClaudeUsageTray.spec       # …then the main exe, which embeds it
+pyinstaller ClaudebarHook.spec   # slim hook helper first…
+pyinstaller Claudebar.spec       # …then the main exe, which embeds it
 ```
 
 The two `.spec` files are the canonical build definitions (same ones the release
-workflow runs). The hook spec builds `ClaudeUsageTrayHook.exe` — the same script
+workflow runs). The hook spec builds `ClaudebarHook.exe` — the same script
 with the GUI packages excluded, several times smaller so Claude Code's per-turn
 hook spawns are fast — and the main spec embeds it into
-`dist/ClaudeUsageTray.exe`, a single self-contained file that runs the tray app,
+`dist/Claudebar.exe`, a single self-contained file that runs the tray app,
 the hooks, and the auto-install, with no Python needed. The icon is baked in at
 build time (the tray icon itself is drawn by Pillow at runtime), so
 `generate_icon.py` needs to have produced a real `icon.ico` on disk first.
 
 > Testing the hook on a freshly built exe: use `cmd` redirection
-> (`ClaudeUsageTray.exe --statusline-hook < payload.json > out.txt`), **not** a
+> (`Claudebar.exe --statusline-hook < payload.json > out.txt`), **not** a
 > PowerShell pipe — PowerShell doesn't capture a windowed exe's stdout, so a pipe
 > would look like it produced nothing even though it works.
 
@@ -293,7 +293,7 @@ entry. The menu item is grayed out on non-Windows platforms.
 > The registry read/write is unit-tested against a disposable subkey but hasn't
 > been confirmed end-to-end across a real logout/login yet. If the app doesn't
 > appear after enabling it, check Task Manager's Startup tab or `regedit` under
-> the path above for a `ClaudeUsageTray` value.
+> the path above for a `Claudebar` value.
 >
 > If you move, rename, or rebuild the `.exe` (or move the script, if running from
 > source) after enabling the toggle, the registry entry still points at the old
@@ -302,11 +302,11 @@ entry. The menu item is grayed out on non-Windows platforms.
 
 Prefer not to touch the registry? The manual alternative works too: press
 `Win + R`, type `shell:startup`, press Enter, and drop a shortcut to the `.exe`
-(or a `python claude_usage_tray.py` launcher) into that folder.
+(or a `python claudebar.py` launcher) into that folder.
 
 ## About the cost estimate
 
-There's a small price table near the top of `claude_usage_tray.py`
+There's a small price table near the top of `claudebar.py`
 (`PRICES_PER_MILLION`, USD per million tokens, for input / output / cache-write /
 cache-read across the Opus / Sonnet / Haiku tiers), snapshotted as of the date in
 `PRICES_AS_OF` (also shown in the tray menu). These rates change over time and
@@ -316,7 +316,7 @@ https://platform.claude.com/docs/en/about-claude/pricing and update the dict.
 ## Running the test suite
 
 ```bash
-python claude_usage_tray.py --test
+python claudebar.py --test
 ```
 
 Runs entirely against a temporary synthetic folder — it never touches your real
@@ -332,10 +332,10 @@ filesystem-watcher latency.
 
 | File | What it is |
 |---|---|
-| `claude_usage_tray.py` | The entire app — tray, widget, tracker, statusLine hook, working-state event hook, hook auto-install, tests. Deliberately single-file. |
+| `claudebar.py` | The entire app — tray, widget, tracker, statusLine hook, working-state event hook, hook auto-install, tests. Deliberately single-file. |
 | `generate_icon.py` | Generates `icon.ico` for the PyInstaller build. |
 | `requirements.txt` | Runtime dependencies (pinned exactly — they flow into released exes). |
-| `ClaudeUsageTray.spec` / `ClaudeUsageTrayHook.spec` | Canonical PyInstaller build definitions (main exe + slim hook helper). |
+| `Claudebar.spec` / `ClaudebarHook.spec` | Canonical PyInstaller build definitions (main exe + slim hook helper). |
 | `build_exe.bat` | Local build convenience wrapper around the two specs. |
 | `VERSION` | Single source of truth for the release version (checked against `__version__` by `--test`); the workflow tags from it. |
 | `.github/workflows/release.yml` | Builds both exes on push to `master`, smoke-tests the hooks, and publishes a GitHub release with checksums. |
@@ -348,7 +348,7 @@ filesystem-watcher latency.
 
 Contributions welcome. A few conventions this project holds to:
 
-- Run `python claude_usage_tray.py --test` before opening a PR — it must stay
+- Run `python claudebar.py --test` before opening a PR — it must stay
   green and GUI-free.
 - Keep **pure, testable logic at module level** and **GUI-only code as closures
   inside `run_app()`** — that split is what lets `--test` run without a display.

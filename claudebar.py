@@ -1,12 +1,12 @@
 """
-claude_usage_tray.py — single-file Windows tray app showing live Claude Code
+claudebar.py — single-file Windows tray app showing live Claude Code
 token usage and estimated cost, read straight from Claude Code's local
 session logs.
 
 Usage:
-    python claude_usage_tray.py                  # run the tray app
-    python claude_usage_tray.py --test           # run the built-in test suite
-    python claude_usage_tray.py --statusline-hook  # used internally as Claude
+    python claudebar.py                  # run the tray app
+    python claudebar.py --test           # run the built-in test suite
+    python claudebar.py --statusline-hook  # used internally as Claude
                                                     # Code's `statusLine` command
                                                     # (see README.md)
 
@@ -64,14 +64,14 @@ PROJECTS_DIR = os.path.join(CLAUDE_HOME, "projects")
 
 # Where the --statusline-hook mode caches the session/weekly rate-limit
 # numbers it receives from Claude Code, for the tray app to read.
-USAGE_CACHE_PATH = os.path.join(CLAUDE_HOME, "usage_tray_cache.json")
+USAGE_CACHE_PATH = os.path.join(CLAUDE_HOME, "claudebar_cache.json")
 
 # Our own marker recording that we've wired the statusLine hook into Claude
 # Code's settings.json (see ensure_hook_installed). Deliberately a separate
 # sidecar, NOT a key inside settings.json -- that file's parse is strict and
 # fragile (one stray key/comment breaks all of it), so we never write anything
 # but the `statusLine` entry into it.
-HOOK_INSTALLED_MARKER_PATH = os.path.join(CLAUDE_HOME, "usage_tray_hook_installed.json")
+HOOK_INSTALLED_MARKER_PATH = os.path.join(CLAUDE_HOME, "claudebar_hook_installed.json")
 
 # Where the --state-hook mode caches Claude Code's *current working state*
 # (working / waiting-on-you / done), for the widget and tray icon to colour a
@@ -79,12 +79,12 @@ HOOK_INSTALLED_MARKER_PATH = os.path.join(CLAUDE_HOME, "usage_tray_hook_installe
 # token logs and the statusLine rate-limit cache: it comes from Claude Code's
 # event-hooks system (Stop/Notification/UserPromptSubmit/PreToolUse), the only
 # mechanism that exposes live per-turn lifecycle state. See ARCHITECTURE.md §2.
-STATE_CACHE_PATH = os.path.join(CLAUDE_HOME, "usage_tray_state_cache.json")
+STATE_CACHE_PATH = os.path.join(CLAUDE_HOME, "claudebar_state_cache.json")
 
 # Marker recording that we've merged our --state-hook entries into settings.json's
 # `hooks` array (see ensure_state_hooks_installed). Separate sidecar for the same
 # reason as HOOK_INSTALLED_MARKER_PATH above.
-STATE_HOOKS_MARKER_PATH = os.path.join(CLAUDE_HOME, "usage_tray_state_hooks_installed.json")
+STATE_HOOKS_MARKER_PATH = os.path.join(CLAUDE_HOME, "claudebar_state_hooks_installed.json")
 
 # A cached working state older than this (seconds) is treated as unknown (dim),
 # so a missed Stop hook or an app started mid-turn can't leave "working" stuck on.
@@ -93,7 +93,7 @@ STATE_STALE_SECONDS = 300
 # Small user-preferences sidecar (currently just the "notify when Claude needs
 # input" toggle). Same fail-soft atomic-write shape as the other sidecars; a
 # missing or corrupted file degrades to defaults, never a crash.
-PREFS_PATH = os.path.join(CLAUDE_HOME, "usage_tray_prefs.json")
+PREFS_PATH = os.path.join(CLAUDE_HOME, "claudebar_prefs.json")
 
 # Claude Code hook events we register --state-hook against, and the working state
 # each maps to. Order/keys mirror derive_working_state()'s logic; used both to
@@ -982,7 +982,7 @@ def virtual_screen_bounds():
 _single_instance_handle = None
 
 
-def acquire_single_instance_lock(name="Local\\ClaudeUsageTray-single-instance"):
+def acquire_single_instance_lock(name="Local\\Claudebar-single-instance"):
     """Try to become the one running instance (named Win32 mutex).
 
     Returns True when acquired, False when another instance already holds it,
@@ -1017,7 +1017,7 @@ def acquire_single_instance_lock(name="Local\\ClaudeUsageTray-single-instance"):
 # file I/O elsewhere in this file -- never raise into a long-running thread.
 # --------------------------------------------------------------------------
 
-STARTUP_APP_NAME = "ClaudeUsageTray"   # matches build_exe.bat's --name
+STARTUP_APP_NAME = "Claudebar"   # matches build_exe.bat's --name
 STARTUP_RUN_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
@@ -1053,7 +1053,7 @@ def build_hook_command(frozen, executable, script_path):
       subsystem's raw fds at runtime (see _read_hook_stdin), so a windowed
       build still works as the hook.
     - frozen=False -> the running interpreter + this script + --statusline-hook
-      (the plain `python claude_usage_tray.py --statusline-hook` form).
+      (the plain `python claudebar.py --statusline-hook` form).
     """
     if frozen:
         return f'"{executable}" --statusline-hook'
@@ -1409,14 +1409,14 @@ def ensure_hook_installed(settings_path, command, marker_path, force=False):
 # whole bundle (Pillow/pystray/watchdog/tkinter) on EVERY launch — and Claude
 # Code launches the hook command on every statusline render and every
 # registered lifecycle event, PreToolUse included (which is blocking). So the
-# release build also produces ClaudeUsageTrayHook.exe: the same script, GUI
+# release build also produces ClaudebarHook.exe: the same script, GUI
 # packages excluded, several times smaller and correspondingly faster to
 # extract. It is bundled INSIDE the main exe (single-file download preserved),
 # extracted to ~/.claude/bin/ at startup, and registered as the hook command.
 # Every step fails soft back to registering the main exe itself.
 # ---------------------------------------------------------------------------
 
-HOOK_EXE_NAME = "ClaudeUsageTrayHook.exe"
+HOOK_EXE_NAME = "ClaudebarHook.exe"
 HOOK_EXE_INSTALL_DIR = os.path.join(CLAUDE_HOME, "bin")
 
 
@@ -1840,10 +1840,10 @@ def run_app():
 
     FALLBACK_SWEEP_SECONDS = 30   # safety-net full rescan interval
     WATCHER_RETRY_SECONDS = 5     # retry interval if projects dir doesn't exist yet
-    WIDGET_POS_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_pos.json")
-    ALIGNMENT_CONFIG_PATH = os.path.join(CLAUDE_HOME, "usage_tray_alignment.json")
-    WIDGET_PIN_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_pin.json")
-    WIDGET_FAVORITE_POS_PATH = os.path.join(CLAUDE_HOME, "usage_tray_widget_favorite_pos.json")
+    WIDGET_POS_PATH = os.path.join(CLAUDE_HOME, "claudebar_widget_pos.json")
+    ALIGNMENT_CONFIG_PATH = os.path.join(CLAUDE_HOME, "claudebar_alignment.json")
+    WIDGET_PIN_PATH = os.path.join(CLAUDE_HOME, "claudebar_widget_pin.json")
+    WIDGET_FAVORITE_POS_PATH = os.path.join(CLAUDE_HOME, "claudebar_widget_favorite_pos.json")
 
     ALIGNMENT_CONFIG = TaskbarAlignmentConfig()
     _saved_align = read_usage_cache(cache_path=ALIGNMENT_CONFIG_PATH) or {}
@@ -2785,7 +2785,7 @@ def run_app():
         items.append(pystray.MenuItem("Refresh now", on_refresh))
         items.append(pystray.MenuItem("Open logs folder", on_open_folder))
         items.append(pystray.Menu.SEPARATOR)
-        items.append(pystray.MenuItem(f"ClaudeUsageTray v{__version__}", None, enabled=False))
+        items.append(pystray.MenuItem(f"Claudebar v{__version__}", None, enabled=False))
         items.append(pystray.MenuItem("Quit", on_quit))
         return items
 
@@ -2914,7 +2914,7 @@ def run_app():
         tracker.poll()  # initial full scan so the tray isn't empty on first open
 
     icon = pystray.Icon(
-        "claude_usage_tray",
+        "claudebar",
         icon=make_icon_image(current_state_tag()),
         title=build_title(),
         menu=pystray.Menu(menu_items),
@@ -2934,7 +2934,7 @@ def run_app():
 
 
 # --------------------------------------------------------------------------
-# Built-in test suite — run with: python claude_usage_tray.py --test
+# Built-in test suite — run with: python claudebar.py --test
 # Exercises the data layer (and the live filesystem watcher, if the
 # `watchdog` package is installed) against a synthetic projects tree.
 # No tray/GUI dependencies required.
@@ -3093,7 +3093,7 @@ def run_tests():
 
             watch_dir = os.path.join(tmp_home, "atomic_watch")
             os.makedirs(watch_dir, exist_ok=True)
-            atomic_target = os.path.join(watch_dir, "usage_tray_state_cache.json")
+            atomic_target = os.path.join(watch_dir, "claudebar_state_cache.json")
             write_usage_cache({"state": "working"}, cache_path=atomic_target)  # preexisting
 
             class _AtomicHandler(FileSystemEventHandler):
@@ -3152,7 +3152,7 @@ def run_tests():
         print("statusLine payload parsing: OK")
         print("  status line text:", status_text)
 
-        cache_path = os.path.join(tmp_home, "usage_tray_cache.json")
+        cache_path = os.path.join(tmp_home, "claudebar_cache.json")
         write_usage_cache(cache, cache_path=cache_path)
         read_back = read_usage_cache(cache_path=cache_path)
         assert read_back == cache, (read_back, cache)
@@ -3252,7 +3252,7 @@ def run_tests():
 
         # --- single-instance lock (Windows: real mutex; elsewhere: None) ---
         if sys.platform.startswith("win"):
-            _lock_name = f"Local\\ClaudeUsageTrayTest-{os.getpid()}"
+            _lock_name = f"Local\\ClaudebarTest-{os.getpid()}"
             assert acquire_single_instance_lock(_lock_name) is True
             # second acquisition (same name, held by this very process) must
             # report "already running"
@@ -3263,8 +3263,8 @@ def run_tests():
             print("single-instance lock degrades to None off-Windows: OK")
 
         # --- statusLine hook command construction (pure, frozen-aware) ---
-        exe = r"C:\Apps\ClaudeUsageTray.exe"
-        script = r"C:\code\claude_usage_tray.py"
+        exe = r"C:\Apps\Claudebar.exe"
+        script = r"C:\code\claudebar.py"
         frozen_cmd = build_hook_command(True, exe, script)
         assert frozen_cmd == f'"{exe}" --statusline-hook', frozen_cmd
         py = r"C:\Python312\python.exe"
@@ -3274,7 +3274,7 @@ def run_tests():
         print("build_hook_command (frozen exe vs. python script): OK")
 
         # --- statusLine hook installation ---
-        expected_cmd = build_hook_command(False, "python", "/path/to/claude_usage_tray.py")
+        expected_cmd = build_hook_command(False, "python", "/path/to/claudebar.py")
         expected_block = {"type": "command", "command": expected_cmd}
 
         # Case 1: fresh install (no settings.json)
@@ -3345,7 +3345,7 @@ def run_tests():
         # Case 6: an ours-shaped statusLine (older install path, same
         # --statusline-hook flag) is upgraded in place even without force
         settings_path5 = os.path.join(tmp_home, "settings_upgrade.json")
-        old_ours = '"C:\\OldPlace\\ClaudeUsageTray.exe" --statusline-hook'
+        old_ours = '"C:\\OldPlace\\Claudebar.exe" --statusline-hook'
         with open(settings_path5, "w", encoding="utf-8") as f:
             json.dump({"statusLine": {"type": "command", "command": old_ours}}, f)
         ok6, _ = install_statusline_hook(settings_path5, expected_cmd, force=False)
@@ -3516,7 +3516,7 @@ def run_tests():
         print("build_state_hook_command (frozen exe vs. python script): OK")
 
         # --- install_state_hooks: register all events, idempotent, non-destructive ---
-        state_cmd = build_state_hook_command(False, "python", "/path/to/claude_usage_tray.py")
+        state_cmd = build_state_hook_command(False, "python", "/path/to/claudebar.py")
         # (a) fresh install into a settings file that already has a foreign statusLine
         #     and an unrelated user hook -> both must survive untouched.
         st_settings = os.path.join(tmp_home, "settings_state.json")
@@ -3575,7 +3575,7 @@ def run_tests():
         # events we no longer register (PostToolUse), while the user's own
         # hook on that event survives.
         st_upgrade = os.path.join(tmp_home, "settings_state_upgrade.json")
-        old_state_cmd = '"C:\\OldPlace\\ClaudeUsageTray.exe" --state-hook'
+        old_state_cmd = '"C:\\OldPlace\\Claudebar.exe" --state-hook'
         with open(st_upgrade, "w", encoding="utf-8") as f:
             json.dump({"hooks": {
                 "Stop": [{"matcher": "", "hooks": [
@@ -3648,17 +3648,17 @@ def run_tests():
         # --- Windows startup registration: pure command-string logic ---
         # Pure path/string logic -- runs on any OS, no registry involved.
         cmd = build_startup_command(
-            frozen=True, executable=r"C:\Apps\ClaudeUsageTray.exe",
-            script_path=r"C:\Apps\claude_usage_tray.py",
+            frozen=True, executable=r"C:\Apps\Claudebar.exe",
+            script_path=r"C:\Apps\claudebar.py",
         )
-        assert cmd == '"C:\\Apps\\ClaudeUsageTray.exe"', cmd
+        assert cmd == '"C:\\Apps\\Claudebar.exe"', cmd
 
         cmd = build_startup_command(
             frozen=False, executable=r"C:\Python312\python.exe",
-            script_path=r"C:\code\claude_usage_tray.py",
+            script_path=r"C:\code\claudebar.py",
         )
         # no real pythonw.exe on disk at that fabricated path -> falls back to executable
-        assert cmd == '"C:\\Python312\\python.exe" "C:\\code\\claude_usage_tray.py"', cmd
+        assert cmd == '"C:\\Python312\\python.exe" "C:\\code\\claudebar.py"', cmd
         print("build_startup_command (frozen / non-frozen, no pythonw present): OK")
 
         # pythonw.exe preference: create a *real* file in the tmp sandbox so
@@ -3668,9 +3668,9 @@ def run_tests():
             pass
         fake_py = os.path.join(tmp_home, "python.exe")
         cmd = build_startup_command(
-            frozen=False, executable=fake_py, script_path=r"C:\code\claude_usage_tray.py",
+            frozen=False, executable=fake_py, script_path=r"C:\code\claudebar.py",
         )
-        assert cmd == f'"{fake_pyw}" "C:\\code\\claude_usage_tray.py"', cmd
+        assert cmd == f'"{fake_pyw}" "C:\\code\\claudebar.py"', cmd
         print("build_startup_command prefers pythonw.exe when present alongside python.exe: OK")
 
         # --- Windows startup registration: real registry round-trip (Windows only) ---
@@ -3679,8 +3679,8 @@ def run_tests():
         if sys.platform.startswith("win"):
             try:
                 import winreg
-                test_subkey = r"Software\ClaudeUsageTrayTestOnly_DoNotUseForRealStartup"
-                test_value_name = "ClaudeUsageTrayTest"
+                test_subkey = r"Software\ClaudebarTestOnly_DoNotUseForRealStartup"
+                test_value_name = "ClaudebarTest"
                 try:
                     assert is_startup_enabled(test_value_name, test_subkey) is False
 
@@ -3949,7 +3949,7 @@ def run_tests():
 
 
 if __name__ == "__main__":
-    cli = argparse.ArgumentParser(description="Claude Code usage tray app")
+    cli = argparse.ArgumentParser(description="Claudebar — Claude Code usage tray app")
     cli.add_argument("--test", action="store_true", help="run the built-in test suite and exit")
     cli.add_argument(
         "--statusline-hook", action="store_true",
@@ -3991,12 +3991,12 @@ if __name__ == "__main__":
         try:
             run_app()
         except ImportError as exc:
-            # The slim hook build (ClaudeUsageTrayHook.exe) excludes the GUI
+            # The slim hook build (ClaudebarHook.exe) excludes the GUI
             # packages on purpose; someone double-clicking it should get a
             # pointer at the real app instead of a silent crash.
             message = (
                 f"This build can't run the tray app ({exc}).\n\n"
-                "It is the statusline/state hook helper — run ClaudeUsageTray.exe "
+                "It is the statusline/state hook helper — run Claudebar.exe "
                 "for the tray app, or `pip install -r requirements.txt` when "
                 "running from source."
             )
@@ -4004,7 +4004,7 @@ if __name__ == "__main__":
             if sys.platform.startswith("win") and getattr(sys, "frozen", False):
                 try:
                     import ctypes
-                    ctypes.windll.user32.MessageBoxW(0, message, "Claude Usage Tray", 0x10)
+                    ctypes.windll.user32.MessageBoxW(0, message, "Claudebar", 0x10)
                     shown = True
                 except Exception:
                     pass

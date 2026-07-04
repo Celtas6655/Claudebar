@@ -1,4 +1,4 @@
-# Architecture & Decision History — Claude Code Usage Tray
+# Architecture & Decision History — Claudebar
 
 This document exists to onboard an AI agent (or a human) picking up this
 project for the first time, with zero prior context. It captures not
@@ -65,7 +65,7 @@ live connection to anything is needed to read it. It exists the moment
 Claude Code writes it, and it covers your entire history, not just the
 current session.
 
-**How we read it**: `UsageTracker` (in `claude_usage_tray.py`) walks
+**How we read it**: `UsageTracker` (in `claudebar.py`) walks
 `~/.claude/projects` recursively, reads each `.jsonl` file, and
 aggregates by day / model / project. It tracks a byte offset per file
 (`file_pos` dict) so repeat reads only look at *new* bytes — this is
@@ -115,12 +115,12 @@ That payload looks like:
 whatever this command prints to stdout back to *become* the visible
 status line text in the terminal.
 
-**How we use it**: `claude_usage_tray.py --statusline-hook` is a second
+**How we use it**: `claudebar.py --statusline-hook` is a second
 entry point in the same script. It's meant to be set as the literal
 `statusLine.command` in Claude Code's settings. It reads the JSON from
 stdin, extracts the fields we care about via the pure function
 `process_statusline_payload()`, atomically writes them to a small cache
-file (`~/.claude/usage_tray_cache.json`, via temp-file + `os.replace()`
+file (`~/.claude/claudebar_cache.json`, via temp-file + `os.replace()`
 so concurrent reads never see a half-written file), and prints a compact
 status line back (e.g. `Claude Sonnet 4.6 | ctx 22% | 5h 34% | 7d 12%`)
 so the terminal still shows something useful.
@@ -163,7 +163,7 @@ event fires. This is a distinct pathway from `statusLine` — statusLine is
 for the visible status text and only fires per render; hooks are for
 lifecycle notifications.
 
-**How we use it**: `claude_usage_tray.py --state-hook` is a third entry
+**How we use it**: `claudebar.py --state-hook` is a third entry
 point in the same script, registered (auto, on startup) against the
 events in `STATE_HOOK_EVENTS`. The pure function `derive_working_state()`
 maps the incoming `hook_event_name` to one of three states:
@@ -239,7 +239,7 @@ call site is `apply_icon_state()` — the one place that already dedupes tag
 changes on the watcher/sweep threads — and because `_icon_state["tag"]` is
 seeded at startup, launching the app while a session is already red stays
 quiet; only a live transition notifies. A tray-menu toggle ("Notify when
-Claude needs input", default on) persists to the `usage_tray_prefs.json`
+Claude needs input", default on) persists to the `claudebar_prefs.json`
 sidecar via `read_notify_pref()`/`write_notify_pref()` (fail-soft, atomic,
 corrupted file degrades to the default). Whether the balloon visually
 renders on real Windows has NOT been field-verified (pystray's win32
@@ -249,7 +249,7 @@ backend is expected to work; the dev environment can't display it).
 
 This started as a multi-file Python project (`parser.py` + `app.py` +
 `test_parser.py`), then was explicitly consolidated into one file,
-`claude_usage_tray.py`, on request — specifically so there's one thing
+`claudebar.py`, on request — specifically so there's one thing
 to download/run/test, with `--test` and `--statusline-hook` as CLI flags
 on the same script rather than separate entry points. If this project
 grows substantially, splitting it back into a package is reasonable, but
@@ -326,7 +326,7 @@ This is the part most likely to bite someone making "obvious" changes.
 Two separate `watchdog` `Observer`s are started (in `watcher_loop()`):
 one recursive on `PROJECTS_DIR` (reacts to any `.jsonl` write — token
 data), one non-recursive on `CLAUDE_HOME` itself (reacts to the one
-`usage_tray_cache.json` file changing — rate-limit data, written by the
+`claudebar_cache.json` file changing — rate-limit data, written by the
 statusline hook). `SessionFileHandler` must keep handling **`on_moved`
 (via `event.dest_path`)** alongside modified/created: our caches are
 written atomically (temp + `os.replace`), and on Windows that replace
@@ -467,7 +467,7 @@ shipped in the repo — `--test` (the user-facing test mode) deliberately
 never imports `pystray`/`Pillow`/`tkinter` at all (see §7), so it can't
 accidentally depend on Xvfb or a stub. If you need to re-verify a GUI
 change, recreate this harness as a throwaway script; don't merge it into
-`claude_usage_tray.py` itself.
+`claudebar.py` itself.
 
 ### Initial widget placement: best-effort taskbar detection
 
@@ -495,9 +495,9 @@ it.
 
 ### Favorite widget position (single slot)
 
-A fourth small JSON sidecar, `usage_tray_widget_favorite_pos.json`
+A fourth small JSON sidecar, `claudebar_widget_favorite_pos.json`
 (`WIDGET_FAVORITE_POS_PATH`), holds one user-designated "return to this
-spot" position — independent of `usage_tray_widget_pos.json`, which always
+spot" position — independent of `claudebar_widget_pos.json`, which always
 tracks wherever the widget last ended up (drag, alignment, or a favorite
 load). It's a single slot by deliberate choice, not a named list, per an
 explicit product decision — this was raised and decided directly with the
@@ -512,13 +512,13 @@ into a shared attribute after every reposition — `__init__`, `_end_drag()`,
 `_apply_favorite_position()` — the newest instance of the
 flag-set-elsewhere/polled-in-`_tick()` pattern already described in §5, not
 a new mechanism. Loading a favorite also disables `ALIGNMENT_CONFIG.enabled`
-and overwrites `usage_tray_widget_pos.json`, mirroring exactly what
+and overwrites `claudebar_widget_pos.json`, mirroring exactly what
 `_end_drag()` already does, so a restart keeps the loaded favorite as the
 new baseline instead of reverting to wherever the widget was before the load.
 
 ## 7. Testing philosophy
 
-`python claude_usage_tray.py --test` runs a self-contained suite with
+`python claudebar.py --test` runs a self-contained suite with
 two hard constraints that shape how it's written:
 
 1. **It must work without a GUI backend.** `pystray`, `Pillow`, and
@@ -560,16 +560,16 @@ Everything this app reads or writes, and why:
 | Path | Written by | Read by | Purpose |
 |---|---|---|---|
 | `~/.claude/projects/**/*.jsonl` | Claude Code itself (not us) | `UsageTracker` | Token usage, cost, model/project breakdown. Read-only to us. |
-| `~/.claude/usage_tray_cache.json` | `--statusline-hook` mode | tray menu, floating widget | Session (5h) %, weekly (7d) %, context-window %, reset timestamps. Atomic write (temp file + `os.replace`). |
-| `~/.claude/usage_tray_state_cache.json` | `--state-hook` mode | tray icon (RAG pip), floating widget (RAG dot), tray menu/tooltip | Claude Code's current working state (`working`/`waiting`/`done`) + `updated_at`. Coloured Red/Amber/Green; treated as unknown (dim) past `STATE_STALE_SECONDS`. Atomic write. See §2c. |
-| `~/.claude/usage_tray_state_hooks_installed.json` | `write_state_hooks_marker` (via `ensure_state_hooks_installed`) | tray menu indicator; avoid redundant writes | Marker recording that *we* merged the `--state-hook` entries into `settings.json`'s `hooks` array, and the command we wrote. Separate sidecar, NOT a key in `settings.json`. Same atomic-write shape. |
-| `~/.claude/bin/ClaudeUsageTrayHook.exe` | `install_hook_exe()` (extracted from the frozen main exe's bundle at startup) | Claude Code itself (spawned as the statusLine / state-hook command) | Slim GUI-free build of the same script, so per-turn hook spawns don't pay the full onefile extraction (§9). Content-compared before replacing; replace failure while a hook is running keeps the old copy (fail-soft). Absent when running from source. |
-| `~/.claude/usage_tray_prefs.json` | tray menu's "Notify when Claude needs input" toggle (`on_toggle_notify` → `write_notify_pref`) | `read_notify_pref()` (menu `checked=` state and the notify decision in `apply_icon_state`) | Small user-preferences sidecar; currently just `notify_on_waiting` (bool, default true). Toggle writes preserve unknown keys. Same atomic-write, fail-soft shape. |
-| `~/.claude/usage_tray_widget_pos.json` | `FloatingWidget._end_drag()` | `FloatingWidget._default_position()` | Remembers where the user dragged the widget, so the taskbar-detection heuristic only applies once, ever. |
-| `~/.claude/usage_tray_widget_favorite_pos.json` | tray menu's "Save current position as favorite" (`on_save_favorite`, via `widget.last_known_pos`) | `FloatingWidget._apply_favorite_position()`; "Load favorite position" menu item's `enabled=` check | User-designated single favorite screen position, independent of the last-dragged position (`usage_tray_widget_pos.json`). Same atomic-write shape. |
+| `~/.claude/claudebar_cache.json` | `--statusline-hook` mode | tray menu, floating widget | Session (5h) %, weekly (7d) %, context-window %, reset timestamps. Atomic write (temp file + `os.replace`). |
+| `~/.claude/claudebar_state_cache.json` | `--state-hook` mode | tray icon (RAG pip), floating widget (RAG dot), tray menu/tooltip | Claude Code's current working state (`working`/`waiting`/`done`) + `updated_at`. Coloured Red/Amber/Green; treated as unknown (dim) past `STATE_STALE_SECONDS`. Atomic write. See §2c. |
+| `~/.claude/claudebar_state_hooks_installed.json` | `write_state_hooks_marker` (via `ensure_state_hooks_installed`) | tray menu indicator; avoid redundant writes | Marker recording that *we* merged the `--state-hook` entries into `settings.json`'s `hooks` array, and the command we wrote. Separate sidecar, NOT a key in `settings.json`. Same atomic-write shape. |
+| `~/.claude/bin/ClaudebarHook.exe` | `install_hook_exe()` (extracted from the frozen main exe's bundle at startup) | Claude Code itself (spawned as the statusLine / state-hook command) | Slim GUI-free build of the same script, so per-turn hook spawns don't pay the full onefile extraction (§9). Content-compared before replacing; replace failure while a hook is running keeps the old copy (fail-soft). Absent when running from source. |
+| `~/.claude/claudebar_prefs.json` | tray menu's "Notify when Claude needs input" toggle (`on_toggle_notify` → `write_notify_pref`) | `read_notify_pref()` (menu `checked=` state and the notify decision in `apply_icon_state`) | Small user-preferences sidecar; currently just `notify_on_waiting` (bool, default true). Toggle writes preserve unknown keys. Same atomic-write, fail-soft shape. |
+| `~/.claude/claudebar_widget_pos.json` | `FloatingWidget._end_drag()` | `FloatingWidget._default_position()` | Remembers where the user dragged the widget, so the taskbar-detection heuristic only applies once, ever. |
+| `~/.claude/claudebar_widget_favorite_pos.json` | tray menu's "Save current position as favorite" (`on_save_favorite`, via `widget.last_known_pos`) | `FloatingWidget._apply_favorite_position()`; "Load favorite position" menu item's `enabled=` check | User-designated single favorite screen position, independent of the last-dragged position (`claudebar_widget_pos.json`). Same atomic-write shape. |
 | `~/.claude/settings.json` | the user, or this app's auto-install (`ensure_hook_installed` / `ensure_state_hooks_installed`), or `--install-hook` / `--install-state-hooks` (force) | Claude Code itself | Two things the app manages here: `statusLine.command` (rate-limit data, §2b) and `hooks.<event>[]` entries for `--state-hook` (working state, §2c). On startup it adds its `statusLine` when absent and its `hooks` entries when missing; it only ever **appends** its own hook groups and never removes/edits the user's own `statusLine` or `hooks` (unless the corresponding `--install-*` force flag is used). Writes nothing else — a stray key would break the file's strict parse, §10. |
-| `~/.claude/usage_tray_hook_installed.json` | `write_hook_marker` (via `ensure_hook_installed`) | tray menu indicator; `ensure_hook_installed` (avoid redundant writes) | Marker recording that *we* installed the statusLine hook, and the command we wrote. Deliberately a separate sidecar, NOT a key in `settings.json`. Same atomic-write shape. |
-| `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`ClaudeUsageTray` value) | tray menu's "Run on Windows startup" toggle (`on_toggle_startup` → `set_startup_enabled`) | Windows itself, at login | Per-user autostart registration. Not a file, but the same "external state this app manages" category — added/removed via `winreg`, no admin rights needed (HKCU, not HKLM). |
+| `~/.claude/claudebar_hook_installed.json` | `write_hook_marker` (via `ensure_hook_installed`) | tray menu indicator; `ensure_hook_installed` (avoid redundant writes) | Marker recording that *we* installed the statusLine hook, and the command we wrote. Deliberately a separate sidecar, NOT a key in `settings.json`. Same atomic-write shape. |
+| `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`Claudebar` value) | tray menu's "Run on Windows startup" toggle (`on_toggle_startup` → `set_startup_enabled`) | Windows itself, at login | Per-user autostart registration. Not a file, but the same "external state this app manages" category — added/removed via `winreg`, no admin rights needed (HKCU, not HKLM). |
 
 ## 9. Known limitations and things explicitly not verified
 
@@ -596,7 +596,7 @@ advance:
   `os.read(0, ...)` / `os.write(1, ...)`: when Claude Code invokes the
   statusLine command it *redirects* stdin/stdout via pipes, so fds 0 and 1
   stay valid regardless of subsystem. **Verified on real Windows**: the
-  built exe run as `dist\ClaudeUsageTray.exe --statusline-hook` with
+  built exe run as `dist\Claudebar.exe --statusline-hook` with
   cmd/Node-style handle redirection prints the status line and writes the
   cache correctly. One caveat that bit during testing — a **PowerShell
   pipe** (`... | exe`) does *not* capture a GUI-subsystem exe's stdout, so
@@ -622,7 +622,7 @@ advance:
 - **Hook spawns cost real wall-clock time, dominated by PyInstaller
   onefile self-extraction.** Measured on real Windows hardware
   (2026-07-03): the full 25 MB main exe takes ~1350 ms per hook
-  invocation; the slim 7 MB `ClaudeUsageTrayHook.exe` (GUI packages
+  invocation; the slim 7 MB `ClaudebarHook.exe` (GUI packages
   excluded) takes ~540–610 ms. That's why the slim helper exists, why it —
   not the main exe — gets registered as the hook command on frozen
   installs, and why `PostToolUse` is no longer registered (§2c). Running
@@ -656,7 +656,7 @@ advance:
   really appear in the tray after a full logout/login cycle) has not been
   manually confirmed. If someone reports the app not launching at login
   after enabling the toggle, check Task Manager's Startup tab and
-  `regedit` for the `ClaudeUsageTray` value first. Also note: if the
+  `regedit` for the `Claudebar` value first. Also note: if the
   `.exe`/script is moved, renamed, or rebuilt to a new path after the
   toggle was enabled, the registry entry still points at the old
   location — this isn't auto-repaired, by design (see README).
@@ -688,7 +688,7 @@ writing support docs:
 - **Isolate "my command is broken" from "Claude Code isn't calling my
   command" early.** Test the exact hook invocation manually first:
   ```
-  echo '{"model":{"display_name":"test"},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1782500000}}}' | python claude_usage_tray.py --statusline-hook
+  echo '{"model":{"display_name":"test"},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1782500000}}}' | python claudebar.py --statusline-hook
   ```
   If that doesn't print `test | 5h 50%`, the problem is the script/PATH,
   not Claude Code's wiring. If it does, but the real cache file never
@@ -702,17 +702,17 @@ Given this is moving from "download these files" into a real,
 version-controlled repo, a reasonable starting layout:
 
 ```
-claude-usage-tray/
+claudebar/
 ├── CLAUDE.md                 # short index, loaded automatically by Claude Code
 ├── ARCHITECTURE.md           # this file
 ├── README.md                 # user-facing install/usage instructions
-├── claude_usage_tray.py       # the entire app (still single-file, deliberately)
+├── claudebar.py       # the entire app (still single-file, deliberately)
 ├── requirements.txt
 ├── build_exe.bat
 └── .gitignore                 # dist/, build/, *.spec, __pycache__/, .venv/
 ```
 
-Whether to eventually split `claude_usage_tray.py` into a real package
+Whether to eventually split `claudebar.py` into a real package
 (`tracker.py`, `statusline.py`, `widget.py`, `tray.py`, `__main__.py`) is
 a legitimate question once this grows further, but it's a conscious
 tradeoff against the "one file, easy to grab and run" property that was

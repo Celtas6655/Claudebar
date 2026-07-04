@@ -3,6 +3,6 @@
 # Bump deliberately (run --test + a real build), not implicitly.
 # Verified on real Windows hardware 2026-07-03.
 pystray==0.19.5
-Pillow==12.2.0
+Pillow==12.3.0
 watchdog==6.0.0
 # pywin32 is no longer required: taskbar detection now uses ctypes (stdlib).

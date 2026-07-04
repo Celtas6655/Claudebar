@@ -395,6 +395,33 @@ strategy:
   minimum-size floor anymore — if this regresses, check that ordering
   first.
 
+### Bug 3 — fatal crash on tray-menu click (WinEvent hook calling into Tk)
+
+Found on real Windows, 2026-07-04: opening the tray menu killed the whole
+app with `Fatal Python error: PyEval_RestoreThread: ... the current Python
+thread state is NULL`. The z-order recovery `SetWinEventHook`
+(`EVENT_SYSTEM_FOREGROUND`, installed in `_apply_overlay_styles`) had its
+ctypes callback call `_reassert_topmost()` → `root.attributes("-topmost",
+...)` directly. A `WINEVENT_OUTOFCONTEXT` hook callback is dispatched on
+the installing (Tk) thread, but **re-entrantly, from inside
+`Tcl_DoOneEvent`'s Win32 message pump** — a window where `_tkinter` has
+released the GIL and saved its thread state. Calling back into Tcl from
+that context corrupts `_tkinter`'s thread-state bookkeeping; the next
+Tcl→Python transition restores a NULL thread state and aborts the
+process. The tray menu triggered it reliably because the menu popup takes
+foreground, firing the event.
+
+The rule this adds to §5's cross-thread pattern: **a ctypes callback must
+never call into Tk/Tcl, even when it technically runs on the Tk thread** —
+"on the Tk thread" is not the same as "at a safe point in the Tk event
+loop". The fix is the same flag pattern as everything else:
+`_on_foreground_change` only sets a plain `self._topmost_dirty` attribute
+(no Tcl involved), and the existing 150 ms `_fast_tick` `after()` loop
+consumes it and calls `_reassert_topmost()` from a safe point. Worst-case
+z-order recovery latency went from ~0 to 150 ms, imperceptible in
+practice. A source-inspection regression guard in `--test` pins the
+callback body to the flag-only shape.
+
 ### How this was verified (since there's no Windows machine in the dev sandbox)
 
 There's a recurring tension in this project: development happened in a

@@ -2012,6 +2012,7 @@ def run_app():
             self._dragging = False
             self._win_event_hook = None   # WinEventHook handle (Windows only)
             self._win_event_proc = None   # keep reference — ctypes GC will break the hook
+            self._topmost_dirty = False   # set by the WinEvent callback, applied in _fast_tick
             self._overlay_hwnd = None     # resolved by _apply_overlay_styles()
             self._render()                  # render real content first...
             self.root.update_idletasks()    # ...so reqwidth/reqheight reflect it...
@@ -2086,7 +2087,13 @@ def run_app():
                     ctypes.wintypes.DWORD,
                 )
                 def _on_foreground_change(_h, _e, _w, _o, _c, _t, _ms):
-                    self._reassert_topmost()
+                    # This ctypes callback is dispatched re-entrantly inside
+                    # Tcl_DoOneEvent's message pump, where _tkinter has saved
+                    # its thread state. Any Tcl call from here (e.g.
+                    # root.attributes) corrupts that bookkeeping and fatals
+                    # with "PyEval_RestoreThread: ... thread state is NULL".
+                    # Only touch plain Python state; _fast_tick applies it.
+                    self._topmost_dirty = True
                 self._win_event_proc = _WinEventProc(_on_foreground_change)
                 self._win_event_hook = ctypes.windll.user32.SetWinEventHook(
                     0x0003, 0x0003, None, self._win_event_proc,
@@ -2470,11 +2477,16 @@ def run_app():
                 pass
 
         def _fast_tick(self):
-            """Runs every 150ms: drives hover alpha.
-            Topmost z-order is managed by the WinEvent hook (event-driven),
-            not polled here — that was the 'normal always-on-top' approach."""
+            """Runs every 150ms: drives hover alpha and applies any pending
+            topmost re-assert flagged by the WinEvent hook. The hook callback
+            itself must never call into Tk (see _on_foreground_change), so it
+            just sets _topmost_dirty and this loop does the actual Tcl call."""
             if should_quit.is_set():
                 return
+            if self._topmost_dirty:
+                self._topmost_dirty = False
+                if widget_visible.is_set():
+                    self._reassert_topmost()
             if widget_visible.is_set() and not self._dragging:
                 try:
                     mx = self.root.winfo_pointerx()
@@ -3841,6 +3853,43 @@ def run_tests():
             "load_favorite_requested.set(), not move the window itself"
         )
         print("on_load_favorite only signals an Event, never touches Tkinter: OK")
+
+        # Guard 6: the WinEvent hook callback must never call into Tk/Tcl.
+        # This DID happen: _on_foreground_change called _reassert_topmost()
+        # (-> root.attributes) directly. The callback is dispatched
+        # re-entrantly inside Tcl_DoOneEvent's message pump, where _tkinter
+        # has saved its thread state; re-entering Tcl from there corrupts
+        # that bookkeeping and crashes the whole app with
+        # "Fatal Python error: PyEval_RestoreThread: ... thread state is
+        # NULL" (observed on real Windows, 2026-07-04, triggered by opening
+        # the tray menu -> EVENT_SYSTEM_FOREGROUND). The callback may only
+        # set the plain _topmost_dirty flag; _fast_tick applies it.
+        _m = re.search(
+            r"\n( +)def _on_foreground_change\(.*?\):(.*?)(?=\n\1\S|\n {,15}\S)",
+            _src, re.DOTALL,
+        )
+        assert _m, "_on_foreground_change not found in source"
+        _ofc = "\n".join(
+            ln for ln in _m.group(2).splitlines()
+            if not ln.lstrip().startswith("#")
+        )
+        for _forbidden in ("_reassert_topmost", "self.root", ".attributes(", ".after("):
+            assert _forbidden not in _ofc, (
+                f"REGRESSION: _on_foreground_change (a ctypes WinEvent callback "
+                f"dispatched inside Tcl's message pump) must not call {_forbidden!r} "
+                "-- any Tk/Tcl call from that context fatals with "
+                "PyEval_RestoreThread: NULL thread state. Set _topmost_dirty and "
+                "let _fast_tick do the Tcl call."
+            )
+        assert "_topmost_dirty" in _ofc, (
+            "REGRESSION: _on_foreground_change must signal via self._topmost_dirty"
+        )
+        assert "_topmost_dirty" in _src[_src.find("def _fast_tick"):
+                                        _src.find("def _tick")], (
+            "REGRESSION: _fast_tick must consume _topmost_dirty and call "
+            "_reassert_topmost from the Tk after() loop"
+        )
+        print("_on_foreground_change never touches Tk (sets _topmost_dirty only): OK")
 
         # Guard 6: the Tk-side application of a loaded favorite must happen
         # inside _tick() (or a method _tick() calls), never inside an on_* handler.

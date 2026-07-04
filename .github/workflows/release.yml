@@ -1,22 +1,79 @@
 name: Build and release exe
 
 # Builds the standalone Windows exe on every push to master and publishes a
-# GitHub release tagged from the VERSION file. Bumping VERSION + merging cuts a
-# new release; re-merges at the same version are a no-op (the tag already
-# exists). Can also be run manually from the Actions tab.
+# GitHub release tagged from the VERSION file. VERSION is bumped automatically
+# (see "Bump version" below) -- nobody needs to hand-edit VERSION/__version__
+# in a PR anymore. Re-runs at an already-released version (e.g. a manual
+# workflow_dispatch, or a push whose HEAD commit is itself a bump commit) are
+# a no-op (the tag already exists). Can also be run manually from the Actions
+# tab, which builds/publishes at the current VERSION without bumping.
 on:
   push:
     branches: [master]
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed to create the tag + release via GITHUB_TOKEN
+  contents: write   # needed to push the version-bump commit and create the tag + release via GITHUB_TOKEN
 
 jobs:
   build-and-release:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Bump version (minor by default; [major]/[patch]/[no-bump] in the HEAD commit message override)
+        # Only on an actual push to master -- workflow_dispatch reruns the
+        # current VERSION as-is (e.g. to rebuild/republish without cutting a
+        # new version). Runs before the Python setup since it's plain git/bash.
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Plain bash substring matching, deliberately not grep -i: grep -qiF
+          # on this exact runner/shell (Git Bash on windows-latest) aborts
+          # (SIGABRT) on a -i+-F pattern containing brackets like "[major]" --
+          # reproduced locally, not a hypothetical. Bash string matching has
+          # no such issue.
+          MSG="$(git log -1 --pretty=%B)"
+          MSG_LOWER="${MSG,,}"
+
+          if [[ "$MSG_LOWER" == *"[no-bump]"* ]]; then
+            echo "HEAD commit marked [no-bump] -- leaving VERSION as-is."
+          else
+            if [[ "$MSG_LOWER" == *"[major]"* ]]; then
+              BUMP=major
+            elif [[ "$MSG_LOWER" == *"[patch]"* ]]; then
+              BUMP=patch
+            else
+              BUMP=minor
+            fi
+
+            CURRENT="$(tr -d '[:space:]' < VERSION)"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+            case "$BUMP" in
+              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+              patch) PATCH=$((PATCH + 1)) ;;
+            esac
+
+            NEW="$MAJOR.$MINOR.$PATCH"
+            echo "Bumping version ($BUMP): $CURRENT -> $NEW"
+
+            printf '%s' "$NEW" > VERSION
+            sed -i "s/^__version__ = \"$CURRENT\"\$/__version__ = \"$NEW\"/" claudebar.py
+            grep -qF "__version__ = \"$NEW\"" claudebar.py
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add VERSION claudebar.py
+            git commit -m "chore: bump version to v$NEW [no-bump]"
+            # Uses the default GITHUB_TOKEN, so this push does not itself
+            # trigger another workflow run (GitHub suppresses that to avoid
+            # recursion) -- this job's own later steps just see the bumped
+            # files already checked out, no re-checkout needed.
+            git push origin HEAD:master
+          fi
 
       - uses: actions/setup-python@v5
         with:

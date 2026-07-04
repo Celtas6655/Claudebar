@@ -1,0 +1,16 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or setup help
+    url: https://github.com/Celtas6655/Claudebar/discussions
+    about: >
+      For usage questions or help wiring up the statusLine hook, please open a
+      Discussion instead of an issue. Before posting, skim the README's "two
+      different data sources" section — most "rate-limit % is blank" reports are
+      the statusLine hook not being set up, or a session that hasn't completed a
+      second turn yet.
+  - name: Design & decision history
+    url: https://github.com/Celtas6655/Claudebar/blob/master/ARCHITECTURE.md
+    about: >
+      Why the app is built the way it is — the two data sources, threading model,
+      bug postmortems, and what's verified vs. not. Worth reading before filing an
+      architectural request.

@@ -1,0 +1,75 @@
+name: Build and release exe
+
+# Builds the standalone Windows exe on every push to master and publishes a
+# GitHub release tagged from the VERSION file. Bumping VERSION + merging cuts a
+# new release; re-merges at the same version are a no-op (the tag already
+# exists). Can also be run manually from the Actions tab.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the tag + release via GITHUB_TOKEN
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        # pyinstaller pinned for the same reason requirements.txt is: released
+        # exes must not silently absorb a new upstream build toolchain.
+        run: python -m pip install -r requirements.txt pyinstaller==6.21.0
+
+      - name: Run test suite (gate)
+        run: python claudebar.py --test
+
+      - name: Build exes (slim hook exe first — the main spec embeds it)
+        run: |
+          python generate_icon.py
+          pyinstaller ClaudebarHook.spec
+          pyinstaller Claudebar.spec
+
+      - name: Smoke-test the statusline hook from both exes (gate)
+        shell: cmd
+        # A --noconsole (GUI-subsystem) exe only exposes stdin/stdout when the
+        # parent redirects them via handles -- which cmd file-redirection and
+        # Claude Code's own spawn both do, but a PowerShell pipe does NOT. So
+        # this gate MUST use cmd redirection, or it would spuriously "fail".
+        run: |
+          echo {"model":{"display_name":"test"},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":4102444800}}}> payload.json
+          dist\Claudebar.exe --statusline-hook < payload.json > hookout.txt
+          type hookout.txt
+          findstr /C:"test | 5h 50%" hookout.txt || (echo MAIN EXE HOOK SMOKE TEST FAILED & exit /b 1)
+          dist\ClaudebarHook.exe --statusline-hook < payload.json > hookout2.txt
+          type hookout2.txt
+          findstr /C:"test | 5h 50%" hookout2.txt || (echo SLIM HOOK EXE SMOKE TEST FAILED & exit /b 1)
+
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "version=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Create release if the tag is new
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          tag="v${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists — nothing to publish."
+            exit 0
+          fi
+          # Checksums so downloads are verifiable (the exe is not code-signed).
+          (cd dist && sha256sum Claudebar.exe) > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release create "$tag" dist/Claudebar.exe SHA256SUMS.txt \
+            --title "$tag" \
+            --notes "Standalone Windows executable for Claudebar (Claude Code usage tray). No Python required — download \`Claudebar.exe\`, run it, and it wires up the statusLine hook automatically (restart Claude Code once). Verify the download against \`SHA256SUMS.txt\`."

@@ -8,9 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Windows tray app + floating widget showing live Claude Code token
 usage, estimated cost, and session (5h)/weekly (7d) rate-limit % with
-reset times. Single-file Python app: `claude_usage_tray.py`, run with no
-args for the app, `--test` for the test suite, `--statusline-hook` as
-the entry point wired into Claude Code's `statusLine` config.
+reset times, plus a Red/Amber/Green indicator of Claude Code's current
+working state. Single-file Python app: `claudebar.py`, run with
+no args for the app, `--test` for the test suite, `--statusline-hook` as
+the entry point wired into Claude Code's `statusLine` config, and
+`--state-hook` as the entry point wired into Claude Code's `hooks` events
+(for the working-state indicator).
 
 Full history — why it's built this way, two postmortem bug writeups,
 the threading model, what's verified vs. not, setup gotchas — is in
@@ -24,29 +27,43 @@ change; don't re-derive decisions that are already explained there.
 pip install -r requirements.txt
 
 # Run the tray app
-python claude_usage_tray.py
+python claudebar.py
 
 # Run the test suite (no GUI, no real ~/.claude access)
-python claude_usage_tray.py --test
+python claudebar.py --test
 
 # Run as Claude Code's statusLine hook (reads stdin JSON, writes cache, prints status line)
-python claude_usage_tray.py --statusline-hook
+python claudebar.py --statusline-hook
 
 # Test the hook manually
-echo '{"model":{"display_name":"test"},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1782500000}}}' | python claude_usage_tray.py --statusline-hook
+echo '{"model":{"display_name":"test"},"rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1782500000}}}' | python claudebar.py --statusline-hook
+
+# Run as a Claude Code event hook (reads stdin JSON, caches Claude's working state)
+python claudebar.py --state-hook
+
+# Test the state hook manually (writes claudebar_state_cache.json)
+echo '{"hook_event_name":"PreToolUse","session_id":"s1"}' | python claudebar.py --state-hook
 ```
 
-There is no linter configured. There is no build step beyond `pip install -r requirements.txt`; the optional `build_exe.bat` (not in this repo) would produce a PyInstaller `.exe` for the tray icon only.
+Linting: `ruff check .` (pinned in CI at the version in `.github/workflows/ci.yml`); keep it clean. Building the exe: `build_exe.bat`, or `pyinstaller ClaudebarHook.spec` then `pyinstaller Claudebar.spec` — the hook spec MUST run first, the main spec embeds its output (the slim per-turn hook helper, see ARCHITECTURE.md §9 on hook-spawn latency). The two `.spec` files are the canonical build definitions; don't reintroduce ad-hoc pyinstaller command lines.
 
 ## The one fact that matters most
 
-Token/cost data and session/weekly-% data come from **two unrelated
-sources**: local JSONL logs (`~/.claude/projects/`) vs. a cache file
-(`~/.claude/usage_tray_cache.json`) written by the `--statusline-hook`
-mode from data Claude Code itself pipes in. Never assume one can
-substitute for the other, and never assume rate-limit % can be derived
-locally from token counts — it can't; it's account-level server state
-exposed only through the statusLine payload. See ARCHITECTURE.md §2.
+The app surfaces **three unrelated data sources**, none substitutable for
+another:
+1. Token/cost/history — local JSONL logs (`~/.claude/projects/`).
+2. Session/weekly rate-limit % — `~/.claude/claudebar_cache.json`, written
+   by `--statusline-hook` from data Claude Code pipes in. Rate-limit % is
+   account-level server state, **not** derivable locally from token counts.
+3. Current working state (RAG indicator) — `~/.claude/claudebar_state_cache.json`,
+   written by `--state-hook` from Claude Code's `hooks` events
+   (UserPromptSubmit/PreToolUse/Stop/Notification/SessionEnd). Live per-turn
+   lifecycle state, exposed **only** through the hooks system — the statusLine
+   payload does not carry it. The cache holds one entry per session
+   (`update_state_cache`); readers aggregate with waiting > working > done
+   (`aggregate_working_state`).
+
+See ARCHITECTURE.md §2.
 
 ## Non-negotiable constraints (regressions to avoid)
 
@@ -54,10 +71,14 @@ exposed only through the statusLine payload. See ARCHITECTURE.md §2.
   `Pillow`, or `tkinter` imports at module level — only inside
   `run_app()`). It must also never touch the real `~/.claude` directory;
   always use temp dirs / explicit path params in tests.
-- The PyInstaller `.exe` build is `--noconsole` (for the tray icon) and
-  **cannot** be used for `--statusline-hook` — that needs real
-  stdin/stdout, use plain `python claude_usage_tray.py
-  --statusline-hook` for the hook regardless of whether an `.exe` exists.
+- The single PyInstaller `--noconsole` `.exe` handles every mode,
+  **including `--statusline-hook`** — but only because the hook path
+  reads/writes fds 0/1 directly (`_read_hook_stdin`/`_write_hook_stdout`),
+  since a windowed build has `sys.stdin`/`sys.stdout == None`. Don't
+  "simplify" the hook back to `json.load(sys.stdin)`/`print()` — that
+  silently breaks the frozen exe. Test the hook with `cmd` redirection
+  (`exe < in.txt > out.txt`), never a PowerShell pipe (which doesn't
+  capture a GUI-subsystem exe's stdout).
 - No cross-thread Tkinter calls. Use a `threading.Event` set elsewhere
   and polled from inside the Tk thread's own `after()` loop — see
   ARCHITECTURE.md §5 for the existing pattern (`widget_visible`,

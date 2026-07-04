@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claudebar — live Claude Code usage, right on your taskbar</title>
+<meta name="description" content="A small Windows tray app + floating widget showing live Claude Code token usage, cost, session/weekly rate limits, and a Red/Amber/Green working-state indicator.">
+<style>
+  :root {
+    --bg: #0b0d12;
+    --bg-alt: #12151d;
+    --card: #161a23;
+    --border: #262b38;
+    --text: #e7eaf1;
+    --text-dim: #9aa3b5;
+    --accent: #f0a742;
+    --accent-2: #7aa2f7;
+    --green: #4caf6f;
+    --amber: #e5a53a;
+    --red: #e5544f;
+    --radius: 12px;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f8fb;
+      --bg-alt: #ffffff;
+      --card: #ffffff;
+      --border: #e3e6ee;
+      --text: #1b1f2a;
+      --text-dim: #5b6272;
+      --accent: #b5720f;
+      --accent-2: #3457c9;
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b0d12; --bg-alt: #12151d; --card: #161a23; --border: #262b38;
+    --text: #e7eaf1; --text-dim: #9aa3b5; --accent: #f0a742; --accent-2: #7aa2f7;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg: #f7f8fb; --bg-alt: #ffffff; --card: #ffffff; --border: #e3e6ee;
+    --text: #1b1f2a; --text-dim: #5b6272; --accent: #b5720f; --accent-2: #3457c9;
+    color-scheme: light;
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55;
+  }
+  a { color: var(--accent-2); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- Hero ---------- */
+  header.hero {
+    padding: 88px 0 64px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+    background:
+      radial-gradient(ellipse 60% 50% at 50% -10%, rgba(240,167,66,0.12), transparent),
+      var(--bg);
+  }
+  .badge-row { display: flex; justify-content: center; gap: 8px; margin-bottom: 22px; flex-wrap: wrap; }
+  .badge-row img { height: 20px; }
+  h1.title {
+    font-size: clamp(2.2rem, 5vw, 3.2rem);
+    margin: 0 0 14px;
+    letter-spacing: -0.02em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+  }
+  .rag-dot {
+    width: 0.62em; height: 0.62em;
+    border-radius: 50%;
+    display: inline-block;
+    background: var(--amber);
+    box-shadow: 0 0 0 0 rgba(229,165,58,0.6);
+    animation: pulse 2.4s ease-in-out infinite;
+    flex: none;
+  }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(229,165,58,0.45); }
+    70%  { box-shadow: 0 0 0 10px rgba(229,165,58,0); }
+    100% { box-shadow: 0 0 0 0 rgba(229,165,58,0); }
+  }
+  p.tagline {
+    font-size: 1.15rem;
+    color: var(--text-dim);
+    max-width: 620px;
+    margin: 0 auto 34px;
+  }
+  .cta-row { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; margin-bottom: 56px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 13px 24px;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 0.98rem;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    transition: transform 0.15s ease, border-color 0.15s ease;
+  }
+  .btn:hover { transform: translateY(-1px); }
+  .btn-primary {
+    background: var(--accent);
+    color: #1a1200;
+    border-color: var(--accent);
+  }
+  .btn-secondary {
+    background: transparent;
+    color: var(--text);
+  }
+  .btn-secondary:hover { border-color: var(--text-dim); }
+
+  .hero-shot {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 22px;
+    display: inline-block;
+    max-width: 100%;
+  }
+  .hero-shot img { max-width: 100%; height: auto; display: block; border-radius: 6px; }
+  .hero-shot figcaption { margin-top: 12px; font-size: 0.85rem; color: var(--text-dim); }
+
+  /* ---------- Sections ---------- */
+  section { padding: 64px 0; border-bottom: 1px solid var(--border); }
+  section:last-of-type { border-bottom: none; }
+  h2.section-title {
+    font-size: 1.7rem;
+    margin: 0 0 8px;
+    letter-spacing: -0.01em;
+  }
+  p.section-lede {
+    color: var(--text-dim);
+    max-width: 640px;
+    margin: 0 0 36px;
+  }
+
+  .grid-4 {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 18px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 22px;
+  }
+  .card .icon { font-size: 1.5rem; margin-bottom: 10px; display: block; }
+  .card h3 { margin: 0 0 8px; font-size: 1.02rem; }
+  .card p { margin: 0; color: var(--text-dim); font-size: 0.92rem; }
+
+  .sources {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 18px;
+  }
+  .source {
+    border-left: 3px solid var(--accent-2);
+    padding: 4px 0 4px 18px;
+  }
+  .source h3 { margin: 0 0 6px; font-size: 1rem; }
+  .source p { margin: 0; color: var(--text-dim); font-size: 0.92rem; }
+  .source.needs-hook { border-left-color: var(--amber); }
+
+  .gallery {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+  .gallery figure {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin: 0;
+    flex: 1 1 260px;
+  }
+  .gallery img { max-width: 100%; height: auto; display: block; border-radius: 6px; margin: 0 auto; }
+  .gallery figcaption { margin-top: 10px; font-size: 0.85rem; color: var(--text-dim); text-align: center; }
+
+  ol.install-steps { padding-left: 1.2em; color: var(--text-dim); }
+  ol.install-steps li { margin-bottom: 10px; }
+  ol.install-steps code { color: var(--text); }
+  .note {
+    margin-top: 22px;
+    padding: 14px 18px;
+    border-radius: var(--radius);
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    font-size: 0.88rem;
+    color: var(--text-dim);
+  }
+
+  code, pre {
+    font-family: "Cascadia Code", Consolas, "SF Mono", Menlo, monospace;
+    font-size: 0.88em;
+  }
+  pre {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+  }
+
+  footer {
+    padding: 40px 0 60px;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.9rem;
+  }
+  footer a { color: var(--text-dim); text-decoration: underline; }
+  footer .links { margin-bottom: 10px; }
+  footer .links a { margin: 0 10px; color: var(--text); text-decoration: none; }
+  footer .links a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="badge-row">
+      <img src="https://github.com/Celtas6655/Claudebar/actions/workflows/ci.yml/badge.svg" alt="CI status">
+      <img src="https://img.shields.io/github/v/release/Celtas6655/Claudebar" alt="Latest release">
+      <img src="https://img.shields.io/github/license/Celtas6655/Claudebar" alt="MIT License">
+    </div>
+    <h1 class="title"><span class="rag-dot" aria-hidden="true"></span> Claudebar</h1>
+    <p class="tagline">
+      Live Claude Code token usage, cost, and rate limits — right on your
+      Windows taskbar. No API key, no network calls, no setup beyond
+      double-clicking the exe.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/Celtas6655/Claudebar/releases/latest">Download for Windows</a>
+      <a class="btn btn-secondary" href="https://github.com/Celtas6655/Claudebar">View on GitHub</a>
+    </div>
+    <figure class="hero-shot">
+      <img src="screenshots/widget.png" alt="The Claudebar floating widget tucked next to the Windows taskbar tray, showing today's tokens/cost and 5h/7d rate-limit bars">
+      <figcaption>The floating widget — always-on-top, borderless, tucked next to your tray icons.</figcaption>
+    </figure>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2 class="section-title">Why it's just a widget, not a dashboard</h2>
+    <p class="section-lede">
+      Everything it shows comes straight from Claude Code's own local data —
+      nothing is uploaded, and nothing needs an API key.
+    </p>
+    <div class="grid-4">
+      <div class="card">
+        <span class="icon">🔑</span>
+        <h3>No API key needed</h3>
+        <p>Reads Claude Code's local session logs directly — not the API.</p>
+      </div>
+      <div class="card">
+        <span class="icon">🔒</span>
+        <h3>Privacy-preserving</h3>
+        <p>Conversation content is never read — only model names, token counts, and rate-limit percentages.</p>
+      </div>
+      <div class="card">
+        <span class="icon">⚡</span>
+        <h3>Real-time</h3>
+        <p>A filesystem watcher reacts the instant Claude Code writes a turn — no polling delay.</p>
+      </div>
+      <div class="card">
+        <span class="icon">🚦</span>
+        <h3>At-a-glance status</h3>
+        <p>A Red/Amber/Green dot shows whether Claude is working, waiting on you, or done.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2 class="section-title">How it works</h2>
+    <p class="section-lede">
+      Three genuinely separate data sources, none substitutable for another —
+      see <a href="https://github.com/Celtas6655/Claudebar/blob/master/ARCHITECTURE.md">ARCHITECTURE.md</a>
+      for the full story.
+    </p>
+    <div class="sources">
+      <div class="source">
+        <h3>Tokens, cost, top models</h3>
+        <p>Read directly from Claude Code's local <code>~/.claude/projects/**/*.jsonl</code> logs. No setup needed beyond running the app.</p>
+      </div>
+      <div class="source needs-hook">
+        <h3>Session (5h) &amp; weekly (7d) %</h3>
+        <p>Account-level rate-limit state that only exists inside Claude Code's live connection to Anthropic. Surfaced via an auto-installed <code>statusLine</code> hook.</p>
+      </div>
+      <div class="source needs-hook">
+        <h3>Working-state indicator</h3>
+        <p>Claude Code's live per-turn lifecycle, exposed only through its event hooks — also auto-installed, never overwrites your own hooks.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2 class="section-title">What it shows</h2>
+    <p class="section-lede">
+      Right-click the tray icon for the full breakdown, or glance at the widget for the same numbers live.
+    </p>
+    <div class="gallery">
+      <figure>
+        <img src="screenshots/tray-tooltip.png" alt="Tray icon tooltip showing today's usage and session/weekly percentages">
+        <figcaption>Hover the tray icon for a quick tooltip.</figcaption>
+      </figure>
+      <figure>
+        <img src="screenshots/tray-menu.png" alt="The tray icon's right-click menu with today/all-time totals, session and weekly rate limits, top models, and app controls">
+        <figcaption>Right-click for today/all-time totals, rate limits, top models, and controls.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2 class="section-title">Install</h2>
+    <p class="section-lede">One self-contained file handles everything — the tray app, the statusLine hook, and the auto-install.</p>
+    <ol class="install-steps">
+      <li>Grab <code>Claudebar.exe</code> from the <a href="https://github.com/Celtas6655/Claudebar/releases/latest">latest release</a>.</li>
+      <li>Double-click it — a tray icon and floating widget appear, and the app wires up the statusLine hook for you automatically.</li>
+      <li>Restart Claude Code once so it starts sending session/weekly % data.</li>
+    </ol>
+    <div class="note">
+      The exe isn't code-signed, so expect a SmartScreen prompt on first run.
+      Each release also ships a <code>SHA256SUMS.txt</code> you can verify the
+      download against — see the
+      <a href="https://github.com/Celtas6655/Claudebar#install">README</a> for
+      the exact command, plus the from-source install path if you'd rather run
+      it with Python.
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="links">
+      <a href="https://github.com/Celtas6655/Claudebar">GitHub</a>
+      <a href="https://github.com/Celtas6655/Claudebar/blob/master/README.md">README</a>
+      <a href="https://github.com/Celtas6655/Claudebar/blob/master/ARCHITECTURE.md">Architecture</a>
+      <a href="https://github.com/Celtas6655/Claudebar/releases">Releases</a>
+    </div>
+    <p>Released under the MIT License.</p>
+  </div>
+</footer>
+
+</body>
+</html>

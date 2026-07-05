@@ -259,9 +259,13 @@ the percentage drawn centered inside each bar.
 
 Releases are built automatically by GitHub Actions
 ([`.github/workflows/release.yml`](.github/workflows/release.yml)): every push to
-`master` builds the exe on a Windows runner, runs the test suite and a hook
-smoke-test as gates, and publishes a release tagged from the `VERSION` file. To
-cut a new version, bump `VERSION` and merge to `master`.
+`master` first bumps `VERSION`/`__version__` automatically (minor by default —
+put `[major]` or `[patch]` in the merge/commit message to bump a different
+part, or `[no-bump]` to skip bumping entirely), then builds the exe on a
+Windows runner, runs the test suite and a hook smoke-test as gates, and
+publishes a release tagged from the (now-bumped) `VERSION` file. Nobody needs
+to hand-edit `VERSION` in a PR — just merge to `master` and a new minor
+release is cut automatically.
 
 To build one locally (or just run `build_exe.bat`, which does exactly this):
 

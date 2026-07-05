@@ -109,7 +109,9 @@ STATE_HOOK_EVENTS = ("UserPromptSubmit", "PreToolUse", "Stop", "Notification", "
 REMOVED_STATE_HOOK_EVENTS = ("PostToolUse",)
 
 # App version -- single source of truth, mirrored by the VERSION file at the
-# repo root that the release workflow reads to tag the build.
+# repo root that the release workflow reads to tag the build. Bumped
+# automatically by release.yml on every push to master (see that file) --
+# don't hand-edit this or VERSION in a PR, it'll just be bumped again on merge.
 __version__ = "1.2.0"
 
 # Approximate USD price per 1M tokens: (input, output, cache_write, cache_read)

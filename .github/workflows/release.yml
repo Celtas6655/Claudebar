@@ -26,7 +26,7 @@ jobs:
       # Checking out with an admin-owned PAT (RELEASE_PUSH_TOKEN secret)
       # makes that push attributable to the admin account instead, which the
       # ruleset already allows to bypass -- see BRANCH_PROTECTION.md.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           token: ${{ secrets.RELEASE_PUSH_TOKEN }}
 
@@ -84,7 +84,7 @@ jobs:
             git push origin HEAD:master
           fi
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 

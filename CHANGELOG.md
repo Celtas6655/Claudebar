@@ -7,6 +7,58 @@ project does not currently follow strict semantic versioning guarantees
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-07-05
+
+### Fixed
+
+- Release workflow's automatic version-bump push now authenticates with an
+  admin-owned PAT (`RELEASE_PUSH_TOKEN`) so it satisfies `master`'s ruleset
+  bypass rule — the default `GITHUB_TOKEN` push wasn't covered by that
+  bypass and could be rejected.
+
+### Added
+
+- GitHub social preview image.
+
+### Changed
+
+- Centered status badges in the README; busted a stale cached license badge
+  image.
+
+## [1.6.0] - 2026-07-05
+
+### Fixed
+
+- The working-state indicator no longer treats every `Notification` hook
+  subtype as "waiting for input." Only genuine input-needed subtypes
+  (`permission_prompt`, `agent_needs_input`, `elicitation_dialog`) turn the
+  dot red — `idle_prompt` (which also fires after a normal `Stop`) and
+  others no longer incorrectly flip a finished turn back to red.
+
+## [1.5.0] - 2026-07-05
+
+### Changed
+
+- Centered README screenshots.
+
+## [1.4.0] - 2026-07-05
+
+### Changed
+
+- Updated the floating-widget screenshot in the README.
+
+## [1.3.0] - 2026-07-05
+
+### Added
+
+- GitHub Pages landing page (`docs/index.html`), set as the repo homepage.
+
+### Changed
+
+- Bumped `actions/checkout` to v7 and `actions/setup-python` to v6 in CI
+  workflows.
+- Bumped Pillow from 12.2.0 to 12.3.0.
+
 ## [1.2.0] - 2026-07-04
 
 Initial public release.
@@ -42,5 +94,10 @@ Initial public release.
 - Filesystem watcher missing atomic cache writes on Windows, where an
   `os.replace` surfaces as a "moved" event rather than modified/created.
 
-[Unreleased]: https://github.com/Celtas6655/Claudebar/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/Celtas6655/Claudebar/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/Celtas6655/Claudebar/compare/v1.6.0...v1.7.0
+[1.6.0]: https://github.com/Celtas6655/Claudebar/compare/v1.5.0...v1.6.0
+[1.5.0]: https://github.com/Celtas6655/Claudebar/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/Celtas6655/Claudebar/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/Celtas6655/Claudebar/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/Celtas6655/Claudebar/releases/tag/v1.2.0

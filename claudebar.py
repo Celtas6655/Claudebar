@@ -1226,19 +1226,42 @@ def derive_working_state(payload):
     Mapping (locked with the user):
       UserPromptSubmit / PreToolUse / PostToolUse -> "working"  (amber)
       Stop                                        -> "done"     (green)
-      Notification                                -> "waiting"  (red, needs you)
+      Notification, by its ``notification_type``:
+        permission_prompt / agent_needs_input / elicitation_dialog
+                                                   -> "waiting"  (red, needs you)
+        agent_completed                           -> "done"     (green)
+        idle_prompt / auth_success / elicitation_complete /
+        elicitation_response / anything else       -> None (no change)
+
+    Notification is not one event, it's several distinct subtypes multiplexed
+    through the same hook_event_name, and only some of them mean "needs you
+    right now" -- idle_prompt in particular just means the terminal has been
+    idle for a while, including *after* a Stop, and agent_completed means the
+    opposite of waiting. Treating every Notification as "waiting" made the
+    indicator flip to red (and fire the toast) after Claude had already
+    finished. A payload with no ``notification_type`` key at all (older Claude
+    Code, before the field existed) falls back to "waiting", matching prior
+    behaviour, since there's no way to tell subtypes apart on those versions.
 
     None (unrecognised or missing ``hook_event_name``) means "leave the last
     known state alone" -- so an older Claude Code that omits the field, or a
     future event we don't handle, simply doesn't overwrite the cache. Kept
     separate from I/O so it's testable."""
-    event = (payload or {}).get("hook_event_name")
+    payload = payload or {}
+    event = payload.get("hook_event_name")
     if event in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
         return "working"
     if event == "Stop":
         return "done"
     if event == "Notification":
-        return "waiting"
+        ntype = payload.get("notification_type")
+        if ntype is None:
+            return "waiting"
+        if ntype in ("permission_prompt", "agent_needs_input", "elicitation_dialog"):
+            return "waiting"
+        if ntype == "agent_completed":
+            return "done"
+        return None
     return None
 
 
@@ -3399,7 +3422,23 @@ def run_tests():
         assert derive_working_state({"hook_event_name": "PreToolUse"}) == "working"
         assert derive_working_state({"hook_event_name": "PostToolUse"}) == "working"
         assert derive_working_state({"hook_event_name": "Stop"}) == "done"
+        # No notification_type at all (older Claude Code) -- preserve old behaviour
         assert derive_working_state({"hook_event_name": "Notification"}) == "waiting"
+        # Blocking subtypes -> waiting
+        for _ntype in ("permission_prompt", "agent_needs_input", "elicitation_dialog"):
+            assert derive_working_state(
+                {"hook_event_name": "Notification", "notification_type": _ntype}
+            ) == "waiting", _ntype
+        # Finished-work subtype -> done, not waiting
+        assert derive_working_state(
+            {"hook_event_name": "Notification", "notification_type": "agent_completed"}
+        ) == "done"
+        # Non-blocking / already-resolved subtypes -> no change (must NOT be "waiting")
+        for _ntype in ("idle_prompt", "auth_success", "elicitation_complete",
+                       "elicitation_response", "some_future_type"):
+            assert derive_working_state(
+                {"hook_event_name": "Notification", "notification_type": _ntype}
+            ) is None, _ntype
         assert derive_working_state({"hook_event_name": "SessionStart"}) is None
         # SessionEnd carries no *state* — update_state_cache handles it as a
         # session removal instead

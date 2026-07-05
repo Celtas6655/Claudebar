@@ -3,8 +3,8 @@
 <div align="center">
 
 [![CI](https://github.com/Celtas6655/Claudebar/actions/workflows/ci.yml/badge.svg)](https://github.com/Celtas6655/Claudebar/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/Celtas6655/Claudebar?cacheSeconds=3600)](https://github.com/Celtas6655/Claudebar/releases/latest)
-[![License: MIT](https://img.shields.io/github/license/Celtas6655/Claudebar?cacheSeconds=3600)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/Celtas6655/Claudebar)](https://github.com/Celtas6655/Claudebar/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/Celtas6655/Claudebar)](LICENSE)
 
 </div>
 

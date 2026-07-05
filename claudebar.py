@@ -112,7 +112,7 @@ REMOVED_STATE_HOOK_EVENTS = ("PostToolUse",)
 # repo root that the release workflow reads to tag the build. Bumped
 # automatically by release.yml on every push to master (see that file) --
 # don't hand-edit this or VERSION in a PR, it'll just be bumped again on merge.
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 # Approximate USD price per 1M tokens: (input, output, cache_write, cache_read)
 # Anthropic's published per-model rates as of PRICES_AS_OF -- treat as a rough

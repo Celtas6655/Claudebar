@@ -172,7 +172,7 @@ maps the incoming `hook_event_name` to one of three states:
 |---|---|---|
 | `UserPromptSubmit`, `PreToolUse` (and `PostToolUse`, see below) | `working` | amber |
 | `Stop` | `done` | green |
-| `Notification` (permission / needs-you) | `waiting` | red |
+| `Notification` — see subtype table below | varies | varies |
 | `SessionEnd` | *(removes the session from the cache)* | — |
 | anything else / missing field | *(None — leave last state)* | — |
 
@@ -180,6 +180,33 @@ Returning `None` for an unrecognised or absent event means the hook
 **doesn't overwrite** the cache, so an older Claude Code that omits
 `hook_event_name`, or a future event we don't handle, simply leaves the
 last known state in place rather than blanking it.
+
+**`Notification` is not one event — it's several distinct subtypes
+multiplexed through the same `hook_event_name`**, distinguished by a
+`notification_type` field: `permission_prompt`, `idle_prompt`,
+`auth_success`, `elicitation_dialog`, `elicitation_complete`,
+`elicitation_response`, `agent_needs_input`, `agent_completed` (the last
+two require Claude Code v2.1.198+). We register with an empty matcher
+(`""`), so our hook fires for every subtype, not just permission prompts.
+An earlier version of `derive_working_state()` mapped *all* of them to
+`waiting` (red) — a real bug, reported by a user: `idle_prompt` fires
+whenever the terminal has been idle for a while, **including after a
+`Stop`**, so the dot (and the notify-on-waiting toast) would flip to red
+sometime after Claude had already finished and gone green, even though
+nothing needed the user. The fix inspects `notification_type`:
+
+| `notification_type` | state | colour |
+|---|---|---|
+| `permission_prompt`, `agent_needs_input`, `elicitation_dialog` | `waiting` | red |
+| `agent_completed` | `done` | green |
+| `idle_prompt`, `auth_success`, `elicitation_complete`, `elicitation_response`, anything else | *(None — leave last state)* | — |
+| *(field absent entirely)* | `waiting` | red |
+
+The all-absent fallback (`waiting`) exists because `notification_type`
+itself is the newer addition — a Claude Code old enough to predate it
+can't be subtype-distinguished, so we preserve the pre-fix behaviour
+rather than silently going blind to real permission prompts on those
+versions.
 
 `PostToolUse` is deliberately **no longer registered** (since 1.2.0):
 `PreToolUse` alone keeps "working" fresh — every tool start refreshes the

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Celtas6655/Claudebar/actions/workflows/ci.yml/badge.svg)](https://github.com/Celtas6655/Claudebar/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/Celtas6655/Claudebar)](https://github.com/Celtas6655/Claudebar/releases/latest)
-[![License: MIT](https://img.shields.io/github/license/Celtas6655/Claudebar)](LICENSE)
+[![License: MIT](https://img.shields.io/github/license/Celtas6655/Claudebar?cacheSeconds=3600)](LICENSE)
 
 A small **Windows** system tray app + floating widget that shows live token
 usage, estimated cost, your session/weekly rate-limit status, and a

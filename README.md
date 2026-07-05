@@ -21,7 +21,9 @@ Everything lives in one file: `claudebar.py`.
 - **At-a-glance status** — a Red/Amber/Green dot shows whether Claude is
   **working** (amber), **waiting on you** (red), or **done** (green)
 
-![The floating widget tucked next to the Windows taskbar tray](docs/screenshots/widget.png)
+<p align="center">
+  <img src="docs/screenshots/widget.png" alt="The floating widget tucked next to the Windows taskbar tray">
+</p>
 
 The floating widget is a borderless, always-on-top panel — just two compact rows
 (no title bar, no close button): the working-state dot and **Today**'s tokens and
@@ -29,7 +31,9 @@ cost, then the **5h** and **7d** bars side by side. The percentage is drawn
 *inside* each colored bar, with its reset time next to it. The tray icon shows
 the same numbers on hover/right-click:
 
-<img src="docs/screenshots/tray-tooltip.png" alt="Tray icon tooltip showing today's usage and session/weekly percentages" width="270">
+<p align="center">
+  <img src="docs/screenshots/tray-tooltip.png" alt="Tray icon tooltip showing today's usage and session/weekly percentages" width="270">
+</p>
 
 ## Install
 
@@ -152,7 +156,9 @@ of the app needed.
 
 ## What it shows
 
-<img src="docs/screenshots/tray-menu.png" alt="The tray icon's right-click menu: today/all-time totals, session and weekly rate limits, top models, and app controls" width="420">
+<p align="center">
+  <img src="docs/screenshots/tray-menu.png" alt="The tray icon's right-click menu: today/all-time totals, session and weekly rate limits, top models, and app controls" width="420">
+</p>
 
 Right-click the tray icon (or read the floating widget) for:
 

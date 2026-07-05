@@ -1,8 +1,9 @@
 # Branch protection
 
-`master` is a protected branch. Protection is **not** stored in this repo — it's
-a GitHub setting applied to the repository. This file documents what the rules
-are and how to (re)apply them, so the config isn't lost knowledge.
+`master` and `develop` are both protected branches. Protection is **not**
+stored in this repo — it's a GitHub setting applied to the repository. This
+file documents what the rules are and how to (re)apply them, so the config
+isn't lost knowledge.
 
 ## What's enforced on `master`
 
@@ -18,8 +19,22 @@ are and how to (re)apply them, so the config isn't lost knowledge.
   `bypass_actors` entry / set `enforce_admins` if you want rules to apply to
   everyone.
 
-`develop` is intentionally left unprotected as the day-to-day working branch;
-CI still runs on it.
+## What's enforced on `develop`
+
+Same shape as `master` (ruleset
+[`protect-develop.json`](rulesets/protect-develop.json), id `18532750`), with
+one deliberate difference: **both** CI jobs are required, not just one.
+
+- **No direct pushes** — all changes land via a pull request.
+- **1 approving review** required before merge; stale approvals are dismissed
+  when new commits are pushed.
+- **CI must pass** — **both** the `test` and `test-windows` status checks
+  (from [`ci.yml`](workflows/ci.yml)) must be green before merging.
+- **Conversations must be resolved** before merge.
+- **No force pushes** (`non_fast_forward`) and **no branch deletion**.
+- **Repo admins can bypass** — same `bypass_actors` shape as `master`, so
+  day-to-day direct work on `develop` is unaffected; this only blocks
+  non-admin collaborators from bypassing the process.
 
 ## The release workflow's bypass dependency
 
@@ -43,13 +58,15 @@ and variables → Actions → New repository secret → name it
 ### Option A — import the ruleset in the UI (no CLI)
 
 1. Repo → **Settings → Rules → Rulesets → New ruleset → Import a ruleset**.
-2. Select [`.github/rulesets/protect-master.json`](rulesets/protect-master.json).
+2. Select [`.github/rulesets/protect-master.json`](rulesets/protect-master.json)
+   or [`.github/rulesets/protect-develop.json`](rulesets/protect-develop.json).
 3. Review and **Create**.
 
 ### Option B — `gh` CLI (classic branch protection)
 
 Requires the [GitHub CLI](https://cli.github.com/) authenticated with admin
-rights (`gh auth login`). This applies the equivalent classic protection:
+rights (`gh auth login`). This applies the equivalent classic protection to
+`master`:
 
 ```bash
 gh api -X PUT repos/Celtas6655/Claudebar/branches/master/protection \
@@ -72,21 +89,36 @@ gh api -X PUT repos/Celtas6655/Claudebar/branches/master/protection \
 JSON
 ```
 
+(Swap `master`/`["test"]` for `develop`/`["test", "test-windows"]` to apply
+the classic equivalent to `develop` instead — but rulesets, below, are what's
+actually applied to both branches today.)
+
 ### Option C — `gh` CLI (import the ruleset instead of classic protection)
 
 ```bash
 gh api -X POST repos/Celtas6655/Claudebar/rulesets \
   -H "Accept: application/vnd.github+json" \
   --input .github/rulesets/protect-master.json
+
+gh api -X POST repos/Celtas6655/Claudebar/rulesets \
+  -H "Accept: application/vnd.github+json" \
+  --input .github/rulesets/protect-develop.json
 ```
 
 ## Verifying
 
 ```bash
-gh api repos/Celtas6655/Claudebar/branches/master/protection    # classic
-gh api repos/Celtas6655/Claudebar/rulesets                      # rulesets
+gh api repos/Celtas6655/Claudebar/branches/master/protection    # classic (404s — master/develop use rulesets, not classic protection)
+gh api repos/Celtas6655/Claudebar/rulesets                      # list rulesets, get their ids
+gh api repos/Celtas6655/Claudebar/rulesets/18400753              # "Protect master" — verify live config
+gh api repos/Celtas6655/Claudebar/rulesets/18532750              # "Protect develop" — verify live config
 ```
 
-> **Note:** the required check is named `test`. If you rename that job in
-> `ci.yml`, update the required-status-check context here and in the ruleset, or
+Each ruleset response's `current_user_can_bypass` field should read
+`"always"` for a repo admin — that's what confirms the bypass is actually
+working, not just configured.
+
+> **Note:** the required checks are named `test` (both branches) and
+> `test-windows` (`develop` only). If you rename those jobs in `ci.yml`,
+> update the required-status-check contexts here and in both rulesets, or
 > merges will hang waiting on a check that never reports.

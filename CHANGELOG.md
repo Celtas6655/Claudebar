@@ -7,6 +7,15 @@ project does not currently follow strict semantic versioning guarantees
 
 ## [Unreleased]
 
+### Fixed
+
+- Floating widget no longer clips content that grows after startup (e.g. the
+  weekly reset clock appearing on the next Claude Code turn after launching
+  while it showed `--`). The window size was frozen by the initial explicit
+  geometry; the widget now re-fits itself to re-rendered content every tick,
+  keeping its right/bottom edges anchored, and both reset labels reserve the
+  clock's full width up front. (ARCHITECTURE.md §6, Bug 4)
+
 ## [1.7.0] - 2026-07-05
 
 ### Fixed

@@ -449,6 +449,47 @@ z-order recovery latency went from ~0 to 150 ms, imperceptible in
 practice. A source-inspection regression guard in `--test` pins the
 callback body to the flag-only shape.
 
+### Bug 4 — window frozen at startup size, later content clipped
+
+Found on real Windows, 2026-07-06 (user screenshot: the weekly reset label
+truncated to "We"). `_place_initial()` sizes the window with an **explicit**
+`geometry("WxH+x+y")`, which permanently disables Tk's auto-resize-to-content
+— while `_render()` keeps changing label text every tick. Any content that is
+narrower at startup than at steady state gets clipped at the frozen edge
+forever: the reset labels show `--` until the statusline cache populates (and
+again after `effective_rate_limits()` nulls a rolled-over window), the state
+label varies `—`/`done`/`working`/`waiting for you`, and the cost text grows
+digits. When a row overflows, `pack` drops the **last-packed widget first** —
+which in the metrics row is `weekly_reset_lbl`, exactly matching the
+screenshot (session clock intact, weekly showing ~2 characters: the width
+`--` occupied at launch).
+
+The fix is two-part, root cause first:
+
+- **`_resize_to_content()`**, called in `_tick()` right after `_render()`,
+  re-applies the geometry whenever the requisition no longer matches the
+  window (via the pure, `--test`-covered `compute_resize_geometry()`). The
+  **right and bottom edges stay anchored** — the widget sits just left of the
+  tray and above/inside the taskbar, so growth must extend left/up, never
+  slide under them; when taskbar alignment owns the position the aligned
+  position is recomputed for the new size instead. It flushes with
+  `update_idletasks()` immediately after `geometry()` because
+  `_reassert_topmost()` runs next in the same tick — the same
+  pending-move-cancelled race as Bug 3's cousin in
+  `_apply_favorite_position()`. Guard 8 in `--test` pins the wiring.
+- **`width=9` reservation on both reset labels** (the footprint of
+  `fmt_reset_clock`'s "Mon 15:30"), so the by-far-most-common growth —
+  `--` → clock on the next Claude Code turn — doesn't change the layout at
+  all; the widget is born wide enough and the resize path is only the safety
+  net for genuinely unforeseen growth.
+
+Verified live on real Windows (2026-07-06) with a throwaway harness in the
+§6 dev-harness style (real `run_app()`, stubbed pystray, fake `CLAUDE_HOME`,
+real `--statusline-hook`/`--state-hook` subprocesses): an artificially
+shrunken window re-fits within 2 ticks, and after weekly data + a
+`waiting` state arrive post-startup, every child widget sits fully inside
+the window on both axes.
+
 ### What it actually looks like on real Windows
 
 `docs/screenshots/` holds real-hardware captures (Windows 11, 2026-07-03,
@@ -825,3 +866,8 @@ Recorded here so they're not lost, not because they're decided:
   `winfo_reqwidth()`/`winfo_reqheight()`.** This was the other half of
   the same bug. `update_idletasks()` after rendering, before reading
   size.
+- **An explicit `geometry("WxH+x+y")` freezes the window's size for
+  good** — Tk stops auto-resizing to content. Any window whose content
+  re-renders after that needs an explicit re-fit path (see Bug 4 /
+  `_resize_to_content()`); don't add new always-varying text to the
+  widget assuming the window will grow to fit it.

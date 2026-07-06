@@ -979,6 +979,28 @@ def virtual_screen_bounds():
         return None
 
 
+def compute_resize_geometry(req_w, req_h, cur_w, cur_h, x, y, bounds=None):
+    """Pure: (w, h, x, y) to apply when a re-render changed the content's
+    required size, or None when the window already fits.
+
+    _place_initial() sets an explicit "WxH" geometry, which permanently
+    disables Tk's auto-resize-to-content — so a label that grows after
+    startup (a reset label going "--" → "Wed 08:00" on the next Claude Code
+    turn, a longer cost) was silently clipped at the frozen edge. The right
+    and bottom edges stay anchored: the widget sits just left of the tray
+    and above/inside the taskbar, so growth must extend left/up, never
+    slide under them. Clamped into bounds (the virtual screen) when given.
+    """
+    req_w, req_h = int(req_w), int(req_h)
+    if (req_w, req_h) == (int(cur_w), int(cur_h)):
+        return None
+    new_x = int(x) + (int(cur_w) - req_w)
+    new_y = int(y) + (int(cur_h) - req_h)
+    if bounds:
+        new_x, new_y = clamp_position(new_x, new_y, req_w, req_h, bounds)
+    return req_w, req_h, new_x, new_y
+
+
 # Handle of the single-instance mutex, kept alive for the process lifetime
 # (releasing it would let a second instance start).
 _single_instance_handle = None
@@ -2006,8 +2028,14 @@ def run_app():
                 metrics_row, width=self.BAR_W, height=self.BAR_H, bg=self.BG, highlightthickness=0,
             )
             self.session_canvas.pack(side="left", padx=(0, 4))
+            # width=9 reserves the clock's footprint ("Mon 15:30", the widest
+            # fmt_reset_clock output) even while showing "--", so the row is
+            # born wide enough and doesn't outgrow the window when real data
+            # arrives after startup. _resize_to_content() is the safety net
+            # for anything this reservation doesn't cover.
             self.session_reset_lbl = tk.Label(
-                metrics_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG, anchor="w",
+                metrics_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG,
+                anchor="w", width=9,
             )
             self.session_reset_lbl.pack(side="left", padx=(4, 10))
 
@@ -2021,7 +2049,8 @@ def run_app():
             )
             self.weekly_canvas.pack(side="left", padx=(0, 4))
             self.weekly_reset_lbl = tk.Label(
-                metrics_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG, anchor="w",
+                metrics_row, font=("Consolas", _fs), fg=self.DIM, bg=self.BG,
+                anchor="w", width=9,   # same reservation as session_reset_lbl
             )
             self.weekly_reset_lbl.pack(side="left", padx=(4, 0))
 
@@ -2284,6 +2313,37 @@ def run_app():
                 self.weekly_canvas, self.weekly_reset_lbl,
                 eff["weekly_pct"], eff["weekly_resets_at"],
             )
+
+        def _resize_to_content(self):
+            """Re-apply the window size when a re-render changed the required
+            size (see compute_resize_geometry). Without this, pack clips the
+            last-packed widget in the overflowing row — observed on real
+            Windows as the weekly reset label truncated to "We". Tk-thread
+            only, called from _tick() right after _render()."""
+            if self._dragging:
+                return
+            plan = compute_resize_geometry(
+                self.root.winfo_reqwidth(), self.root.winfo_reqheight(),
+                self.root.winfo_width(), self.root.winfo_height(),
+                self.root.winfo_x(), self.root.winfo_y(),
+                virtual_screen_bounds(),
+            )
+            if plan is None:
+                return
+            w, h, x, y = plan
+            # When alignment owns the position, recompute it for the new size
+            # instead of edge-anchoring, so the configured gap/clamp still hold.
+            if ALIGNMENT_CONFIG.enabled and not position_pinned.is_set():
+                info = find_taskbar_tray_rect(ALIGNMENT_CONFIG)
+                if info:
+                    self._last_alignment_check = time.monotonic()
+                    x, y = self._compute_aligned_position(w, h, info)
+            self.root.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
+            # Flush the queued resize to Win32 now — _tick() may call
+            # _reassert_topmost() right after this returns, and its synchronous
+            # SetWindowPos would otherwise drop the pending move (same race as
+            # _apply_favorite_position, ARCHITECTURE.md §6).
+            self.root.update_idletasks()
 
         def _compute_aligned_position(self, w, h, info):
             """Return (x, y) in physical pixels for the aligned position.
@@ -2552,6 +2612,7 @@ def run_app():
                         self.root.deiconify()
                         self._set_transparent(True)
                     self._render()
+                    self._resize_to_content()
                     # 1-second safety net for z-order. Only re-assert when we
                     # are demonstrably below the taskbar (or can't tell) — an
                     # unconditional NOTOPMOST→TOPMOST cycle every second churns
@@ -3275,6 +3336,26 @@ def run_tests():
         assert clamp_position(-3000, 0, 300, 50, (-1920, 0, 1920, 1080)) == (-1920, 0)
         print("clamp_position — clamps into virtual-screen bounds: OK")
 
+        # --- compute_resize_geometry: re-fit the frozen window after a re-render ---
+        # size unchanged -> no-op (the common case, every tick)
+        assert compute_resize_geometry(300, 50, 300, 50, 100, 200, _bounds) is None
+        # content grew: right/bottom edges stay anchored (the widget sits left
+        # of the tray / above the taskbar), so the window extends left/up
+        _g = compute_resize_geometry(350, 60, 300, 50, 1000, 900, _bounds)
+        assert _g == (350, 60, 950, 890), _g
+        assert _g[2] + _g[0] == 1000 + 300   # right edge preserved
+        assert _g[3] + _g[1] == 900 + 50     # bottom edge preserved
+        # content shrank: window pulls back toward the same right edge
+        assert compute_resize_geometry(250, 50, 300, 50, 100, 200, _bounds) \
+            == (250, 50, 150, 200)
+        # growth that would push past the left screen edge is clamped back inside
+        assert compute_resize_geometry(400, 50, 300, 50, 50, 200, _bounds) \
+            == (400, 50, 0, 200)
+        # no bounds available (off-Windows / API failure): resize, unclamped
+        assert compute_resize_geometry(350, 50, 300, 50, 10, 200, None) \
+            == (350, 50, -40, 200)
+        print("compute_resize_geometry — right/bottom-anchored re-fit: OK")
+
         # --- single-instance lock (Windows: real mutex; elsewhere: None) ---
         if sys.platform.startswith("win"):
             _lock_name = f"Local\\ClaudebarTest-{os.getpid()}"
@@ -3963,6 +4044,35 @@ def run_tests():
             "called next in the same _tick() invocation, can cancel the pending move"
         )
         print("_apply_favorite_position flushes geometry before returning: OK")
+
+        # Guard 8: _tick() must re-fit the window after every re-render.
+        #
+        # Background: _place_initial() sets an explicit "WxH" geometry, which
+        # permanently disables Tk's auto-resize-to-content, while _render()
+        # keeps changing label text every tick. Without an explicit re-fit,
+        # content that grows after startup (reset "--" -> "Wed 08:00" on the
+        # next Claude Code turn, a longer cost/state label) is clipped at the
+        # frozen edge -- pack drops the last-packed widget in the row first
+        # (observed on real Windows: the weekly reset label truncated to "We").
+        assert "_resize_to_content()" in _tick_body, (
+            "REGRESSION: _tick() must call self._resize_to_content() -- the "
+            "window size is frozen by _place_initial() and never adapts to "
+            "re-rendered content otherwise (clipped labels)"
+        )
+        assert _tick_body.index("self._render()") \
+            < _tick_body.index("self._resize_to_content()"), (
+            "REGRESSION: _resize_to_content() must run AFTER _render() in "
+            "_tick(), so it measures the requisition of the fresh content"
+        )
+        _rtc = _method_body("_resize_to_content")
+        assert ".geometry(" in _rtc \
+            and _rtc.index(".geometry(") < _rtc.index("update_idletasks()"), (
+            "REGRESSION: _resize_to_content must call update_idletasks() right "
+            "after self.root.geometry(...) -- otherwise _reassert_topmost(), "
+            "called next in the same _tick() invocation, can cancel the pending "
+            "resize (same race as Guard 7)"
+        )
+        print("_tick re-fits the window to re-rendered content (Guard 8): OK")
 
         # Guard: SessionFileHandler must handle on_moved via dest_path.
         #
